@@ -1,0 +1,25 @@
+{
+  "users": [
+    { "email": "admin@example.com", "name": "Admin User", "permissions": ["all"] }
+  ],
+  "clients": [
+    { "name": "Craftsman Automation Limited", "gst_number": "GST123", "poc": "Garv Sharma" },
+    { "name": "JBM Logistics", "gst_number": "GST456", "poc": "Rajesh Kumar" }
+  ],
+  "hubs": [
+    { "client_id": null, "name": "Sandhar, Hosur", "gmp_link": "" },
+    { "client_id": null, "name": "Peenya Hub", "gmp_link": "" }
+  ],
+  "parkings": [],
+  "vehicles": [
+    { "id": "TN77T5990", "client": "Craftsman Automation Limited", "hub": "Sandhar, Hosur", "parking": "Hosur Charging Parking", "status": "Running", "battery": 84 },
+    { "id": "KA05EV7781", "client": "JBM Logistics", "hub": "Peenya Hub", "parking": "Warehouse Dock P2", "status": "Charging", "battery": 91 }
+  ],
+  "deployments": [],
+  "driver_assignments": [],
+  "ops_tasks": [],
+  "settings": [
+    { "key": "goodCharge", "value": "70" },
+    { "key": "minDistance", "value": "1" }
+  ]
+}
