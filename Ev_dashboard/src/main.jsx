@@ -3,17 +3,24 @@ import { createRoot } from 'react-dom/client';
 import {
   BatteryCharging,
   Calendar,
+  CalendarDays,
   Car,
   Check,
   CircleAlert,
   Download,
+  ExternalLink,
+  Filter,
   FileSpreadsheet,
   Gauge,
+  IdCard,
   LogIn,
   LogOut,
   Mail,
   MapPin,
   Navigation,
+  ParkingCircle,
+  Pencil,
+  Phone,
   Plus,
   RefreshCw,
   Route,
@@ -24,6 +31,7 @@ import {
   Truck,
   UserRound,
   UsersRound,
+  X,
   Zap,
 } from 'lucide-react';
 import './styles.css';
@@ -202,13 +210,14 @@ const tabPermissions = {
   Overview: 'fleet',
   'EV Fleet': 'fleet',
   Clients: 'deployments',
+  Parking: 'deployments',
+  Drivers: 'drivers',
   Driver: 'driver',
   Operations: ['deployments', 'drivers', 'tasks'],
-  Reports: 'reports',
   Admin: ['alerts', 'all'],
 };
 
-const primaryTabs = ['Overview', 'EV Fleet', 'Clients', 'Reports', 'Operations', 'Admin'];
+const primaryTabs = ['Overview', 'EV Fleet', 'Clients', 'Drivers', 'Parking', 'Operations', 'Admin'];
 
 function App() {
   const [activeTab, setActiveTab] = useState('EV Fleet');
@@ -218,6 +227,7 @@ function App() {
   const [tasks, setTasks] = useState(initialTasks);
   const [driverAssignments, setDriverAssignments] = useState(driverSeed);
   const [clientHubs, setClientHubs] = useState(clientHubSeed);
+  const [drivers, setDrivers] = useState([]);
   const initialParkingSeed = (() => {
     const names = Array.from(new Set(vehiclesSeed.map((v) => v.parking).filter(Boolean)));
     return names.map((name, idx) => ({ id: `P${idx + 1}`, name, totalSpaces: 10, spacesLeft: 10, gmpLink: '' }));
@@ -234,8 +244,7 @@ function App() {
     evEnergy: 0.22,
   });
   const [statusFilter, setStatusFilter] = useState('Active');
-  const [vehicleStatusFilter, setVehicleStatusFilter] = useState('All statuses');
-  const [modelFilter, setModelFilter] = useState('All models');
+  const [fleetFilters, setFleetFilters] = useState({ clients: [], models: [], statuses: [] });
   const [query, setQuery] = useState('');
   const [range, setRange] = useState({ from: '2026-04-29', to: '2026-05-06' });
   const [rangeError, setRangeError] = useState('');
@@ -247,25 +256,63 @@ function App() {
   const [otpSent, setOtpSent] = useState(false);
   const [loginMessage, setLoginMessage] = useState('');
 
+  async function reloadParkingSites() {
+    try {
+      const payload = await apiJson('/api/parking-sites');
+      if (payload.parkings) setParkings(payload.parkings);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function addParkingSite({ name, location, gmpLink, totalSpaces }) {
+    const trimmedName = String(name || '').trim();
+    if (!trimmedName) return false;
+    try {
+      const payload = await apiJson('/api/parking-sites', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: trimmedName,
+          location: String(location || '').trim(),
+          gmpLink: String(gmpLink || '').trim(),
+          totalSpaces: Number(totalSpaces) || 0,
+        }),
+      });
+      if (payload.parkings) setParkings(payload.parkings);
+      setToast('Parking added.');
+      window.setTimeout(() => setToast(''), 2400);
+      return true;
+    } catch (error) {
+      setToast(error.message || 'Unable to add parking.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
+  }
+
+  async function updateParkingSiteSpaces(parkingId, nextSpaces) {
+    try {
+      const payload = await apiJson(`/api/parking-sites/${encodeURIComponent(parkingId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ totalSpaces: Number(nextSpaces) || 0 }),
+      });
+      if (payload.parkings) setParkings(payload.parkings);
+      setToast('Parking spaces updated.');
+      window.setTimeout(() => setToast(''), 2400);
+    } catch (error) {
+      setToast(error.message || 'Unable to update parking.');
+      window.setTimeout(() => setToast(''), 2600);
+    }
+  }
+
+  // Compatibility: Operations ParkingManager currently calls addParking/updateParkingSpaces.
   function addParking({ name, totalSpaces, gmpLink }) {
-    setParkings((current) => {
-      if (current.some((p) => p.name === name)) return current;
-      const coords = extractMapCoords(gmpLink) || null;
-      const newItem = {
-        id: `P${current.length + 1}`,
-        name,
-        totalSpaces: Number(totalSpaces) || 0,
-        spacesLeft: Number(totalSpaces) || 0,
-        gmpLink: gmpLink || '',
-        lat: coords?.lat,
-        lng: coords?.lng,
-      };
-      return [newItem, ...current];
-    });
+    addParkingSite({ name, location: '', gmpLink, totalSpaces });
   }
 
   function updateParkingSpaces(name, nextSpaces) {
-    setParkings((current) => current.map((p) => (p.name === name ? { ...p, totalSpaces: Number(nextSpaces) || 0, spacesLeft: Math.min(Number(nextSpaces) || 0, Number(p.spacesLeft) || 0) } : p)));
+    const match = (parkings || []).find((p) => p.name === name);
+    if (!match) return;
+    updateParkingSiteSpaces(match.parkingId || match.id, nextSpaces);
   }
 
   const selected = vehicles.find((vehicle) => vehicle.id === selectedId) || vehicles[0];
@@ -323,8 +370,18 @@ function App() {
   const visibleTabs = useMemo(() => primaryTabs.filter((tab) => canAccess(auth.user, tabPermissions[tab])), [auth.user]);
   const modelOptions = useMemo(() => uniqueOptions(vehicles.map(modelLabelFor)), [vehicles]);
   const vehicleStatusOptions = useMemo(() => uniqueOptions(vehicles.map((vehicle) => vehicle.status)), [vehicles]);
+  const clientOptions = useMemo(() => uniqueOptions(vehicles.map((vehicle) => normalizeClientName(vehicle.client)).filter(Boolean)), [vehicles]);
   const activeVehicleCount = vehicles.filter((vehicle) => vehicle.status !== 'Offline').length;
   const offlineVehicleCount = vehicles.filter((vehicle) => vehicle.status === 'Offline').length;
+  const driverContactByVehicle = useMemo(() => {
+    const map = new Map();
+    (driverAssignments || []).forEach((assignment) => {
+      const vehicle = String(assignment.vehicle || '').trim().toUpperCase();
+      if (!vehicle) return;
+      map.set(vehicle, { name: assignment.name || '', email: assignment.email || '' });
+    });
+    return map;
+  }, [driverAssignments]);
 
   useEffect(() => {
     if (visibleTabs.length && !visibleTabs.includes(activeTab)) setActiveTab(visibleTabs[0]);
@@ -335,16 +392,22 @@ function App() {
     if (canAccess(auth.user, 'tasks')) {
       apiJson('/api/tasks').then((payload) => setTasks(payload.tasks || [])).catch(() => {});
     }
-    if (canAccess(auth.user, ['drivers', 'driver'])) {
-      apiJson('/api/driver-assignments').then((payload) => {
-        setDriverAssignments(payload.assignments || []);
-        if (payload.assignments?.[0]?.sessionState) setDriverSession(payload.assignments[0].sessionState);
-      }).catch(() => {});
-    }
-    if (canAccess(auth.user, 'reports')) {
-      apiJson('/api/settings').then((payload) => payload.settings && setSettingsState(payload.settings)).catch(() => {});
-    }
-  }, [auth.loading, auth.user]);
+	    if (canAccess(auth.user, ['drivers', 'driver'])) {
+	      apiJson('/api/driver-assignments').then((payload) => {
+	        setDriverAssignments(payload.assignments || []);
+	        if (payload.assignments?.[0]?.sessionState) setDriverSession(payload.assignments[0].sessionState);
+	      }).catch(() => {});
+	    }
+	    if (canAccess(auth.user, 'drivers')) {
+	      apiJson('/api/drivers').then((payload) => setDrivers(payload.drivers || [])).catch(() => {});
+	    }
+	    if (canAccess(auth.user, 'deployments')) {
+	      apiJson('/api/parking-sites').then((payload) => payload.parkings && setParkings(payload.parkings)).catch(() => {});
+	    }
+	    if (canAccess(auth.user, 'reports')) {
+	      apiJson('/api/settings').then((payload) => payload.settings && setSettingsState(payload.settings)).catch(() => {});
+	    }
+	  }, [auth.loading, auth.user]);
 
   const filteredVehicles = useMemo(() => {
     return vehicles.filter((vehicle) => {
@@ -353,11 +416,12 @@ function App() {
         .toLowerCase()
         .includes(query.toLowerCase());
       const matchesStatusGroup = statusFilter === 'Offline' ? vehicle.status === 'Offline' : vehicle.status !== 'Offline';
-      const matchesVehicleStatus = vehicleStatusFilter === 'All statuses' || vehicle.status === vehicleStatusFilter;
-      const matchesModel = modelFilter === 'All models' || modelLabelFor(vehicle) === modelFilter;
-      return matchesQuery && matchesStatusGroup && matchesVehicleStatus && matchesModel;
+      const matchesVehicleStatus = !fleetFilters.statuses.length || fleetFilters.statuses.includes(vehicle.status);
+      const matchesModel = !fleetFilters.models.length || fleetFilters.models.includes(modelLabelFor(vehicle));
+      const matchesClient = !fleetFilters.clients.length || fleetFilters.clients.includes(normalizeClientName(vehicle.client));
+      return matchesQuery && matchesStatusGroup && matchesVehicleStatus && matchesModel && matchesClient;
     });
-  }, [vehicles, query, statusFilter, vehicleStatusFilter, modelFilter]);
+  }, [vehicles, query, statusFilter, fleetFilters]);
 
   useEffect(() => {
     if (filteredVehicles.length && !filteredVehicles.some((vehicle) => vehicle.id === selectedId)) {
@@ -398,8 +462,8 @@ function App() {
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
-    if (!hubs.length || !parkings.length) {
-      setToast('Add at least one hub and one parking point.');
+    if (!hubs.length) {
+      setToast('Add at least one hub.');
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
@@ -413,13 +477,18 @@ function App() {
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
-    if (hubs.some((hub) => !extractMapCoords(hub.gmpLink))) {
-      setToast('Use Google Maps links that include coordinates for each hub.');
+    if (hubs.some((hub) => !mapLinkInfo(hub.gmpLink).valid)) {
+      setToast('Use valid Google Maps links with coordinates for each hub.');
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
-    if (parkings.some((parking) => !extractMapCoords(parking.gmpLink))) {
-      setToast('Use Google Maps links that include coordinates for each parking point.');
+    if (parkings.some((parking) => !mapLinkInfo(parking.gmpLink).valid)) {
+      setToast('Use valid Google Maps links with coordinates for each parking point.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
+    if (parkings.some((parking) => !Number.isFinite(Number(parking.spaces)) || Number(parking.spaces) < 0)) {
+      setToast('Add parking spaces as zero or more.');
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
@@ -431,7 +500,7 @@ function App() {
         gstNumber,
         clientPoc,
         hubs: hubs.map((hub) => `${hub.name} | ${hub.gmpLink}`).join('\n'),
-        parkings: parkings.map((parking) => `${parking.name} | ${parking.gmpLink}`).join('\n'),
+        parkings: parkings.map((parking) => `${parking.name} | ${parking.gmpLink} | ${parking.spaces}`).join('\n'),
       }),
     });
     const payload = await response.json();
@@ -455,6 +524,67 @@ function App() {
       if (payload.clients) setClientHubs(payload.clients);
     } catch (error) {
       // ignore
+    }
+  }
+
+  async function reloadDrivers() {
+    try {
+      const response = await fetch('/api/drivers');
+      if (!response.ok) throw new Error('Unable to load drivers');
+      const payload = await response.json();
+      if (payload.drivers) setDrivers(payload.drivers);
+    } catch (error) {
+      // ignore
+    }
+  }
+
+  async function addDriver(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get('name') || '').trim();
+    const phone = String(form.get('phone') || '').trim();
+    const licenseNumber = String(form.get('licenseNumber') || '').trim();
+    const dob = String(form.get('dob') || '').trim();
+    const email = String(form.get('email') || '').trim();
+
+    if (!name || !phone || !licenseNumber || !dob || !email) {
+      setToast('Fill name, contact number, license, DOB, and email.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
+
+    try {
+      const response = await fetch('/api/drivers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, phone, licenseNumber, dob, email }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || payload.message || 'Unable to save driver');
+      if (payload.drivers) setDrivers(payload.drivers);
+      event.currentTarget.reset();
+      setToast('Driver added.');
+      window.setTimeout(() => setToast(''), 2400);
+      return true;
+    } catch (error) {
+      setToast(error.message || 'Unable to save driver.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
+  }
+
+  async function updateDriverPhone(driverId, phone) {
+    try {
+      const payload = await apiJson(`/api/drivers/${encodeURIComponent(driverId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ phone }),
+      });
+      if (payload.drivers) setDrivers(payload.drivers);
+      setToast('Driver contact updated.');
+      window.setTimeout(() => setToast(''), 2400);
+    } catch (error) {
+      setToast(error.message || 'Unable to update driver.');
+      window.setTimeout(() => setToast(''), 2600);
     }
   }
 
@@ -535,7 +665,7 @@ function App() {
           poc: form.get('poc'),
         }),
       });
-      if (payload.task) setTasks((current) => [payload.task, ...current]);
+      if (payload.tasks?.length) setTasks((current) => [...payload.tasks, ...current]);
     } catch (error) {
       setToast(error.message || 'Unable to save deployment.');
       window.setTimeout(() => setToast(''), 2600);
@@ -809,39 +939,54 @@ function App() {
         </div>
 
         {toast && <div className="toast">{toast}</div>}
-        {activeTab === 'Overview' && <Overview vehicles={vehicles} tasks={tasks} />}
-        {activeTab === 'EV Fleet' && (
-          <FleetView
-            filteredVehicles={filteredVehicles}
-            selected={selected}
-            selectedId={selectedId}
-            setSelectedId={setSelectedId}
-            statusFilter={statusFilter}
-            setStatusFilter={setStatusFilter}
-            vehicleStatusFilter={vehicleStatusFilter}
-            setVehicleStatusFilter={setVehicleStatusFilter}
-            vehicleStatusOptions={vehicleStatusOptions}
-            modelFilter={modelFilter}
-            setModelFilter={setModelFilter}
-            modelOptions={modelOptions}
-            activeVehicleCount={activeVehicleCount}
-            offlineVehicleCount={offlineVehicleCount}
-            query={query}
-            setQuery={setQuery}
-            exportReport={exportReport}
-            mapConfig={mapConfig}
-            parkings={parkings}
-          />
-        )}
-        {activeTab === 'Clients' && (
-          <ClientsHub addClient={addClient} refreshClientHubs={reloadClientHubs} clientHubs={clientHubs} vehicles={vehicles} />
-        )}
-        
-        {activeTab === 'Operations' && (
+        {activeTab === 'Overview' && <Overview vehicles={vehicles} tasks={tasks} clientHubs={clientHubs} parkings={parkings} />}
+	        {activeTab === 'EV Fleet' && (
+	          <FleetView
+	            filteredVehicles={filteredVehicles}
+	            selected={selected}
+	            selectedId={selectedId}
+	            setSelectedId={setSelectedId}
+	            statusFilter={statusFilter}
+	            setStatusFilter={setStatusFilter}
+	            fleetFilters={fleetFilters}
+	            setFleetFilters={setFleetFilters}
+	            vehicleStatusOptions={vehicleStatusOptions}
+	            modelOptions={modelOptions}
+	            clientOptions={clientOptions}
+	            activeVehicleCount={activeVehicleCount}
+	            offlineVehicleCount={offlineVehicleCount}
+	            query={query}
+	            setQuery={setQuery}
+	            mapConfig={mapConfig}
+	            parkings={parkings}
+	            driverContactByVehicle={driverContactByVehicle}
+	          />
+	        )}
+	        {activeTab === 'Clients' && (
+	          <ClientsHub addClient={addClient} refreshClientHubs={reloadClientHubs} clientHubs={clientHubs} vehicles={vehicles} />
+	        )}
+	        {activeTab === 'Drivers' && (
+	          <DriversHub
+	            addDriver={addDriver}
+	            drivers={drivers}
+	            driverAssignments={driverAssignments}
+	            updateDriverPhone={updateDriverPhone}
+	          />
+	        )}
+	        {activeTab === 'Parking' && (
+	          <ParkingHub
+	            parkings={parkings}
+	            addParkingSite={addParkingSite}
+	            updateParkingSiteSpaces={updateParkingSiteSpaces}
+	          />
+	        )}
+	        
+	        {activeTab === 'Operations' && (
           <OperationsHub
             addClient={addClient}
             addDeployment={addDeployment}
             removeDeployment={removeDeployment}
+            removeDeploymentNow={endDeploymentNow}
             assignments={driverAssignments}
             assignDriver={assignDriver}
             clientHubs={clientHubs}
@@ -855,15 +1000,6 @@ function App() {
             parkings={parkings}
             addParking={addParking}
             updateParkingSpaces={updateParkingSpaces}
-          />
-        )}
-        {activeTab === 'Reports' && (
-          <ReportsHub
-            exportReport={exportReport}
-            range={range}
-            rangeError={rangeError}
-            validateRange={validateRange}
-            vehicles={vehicles}
           />
         )}
         {activeTab === 'Admin' && (
@@ -923,20 +1059,45 @@ function LoginScreen({ email, setEmail, otp, setOtp, otpSent, requestOtp, verify
   );
 }
 
-function OperationsHub({ addClient, addDeployment, removeDeployment, assignments, assignDriver, clientHubs, driverSession, markTaskDone, openFleet, selected, selectVehicle, tasks, vehicles, parkings, addParking, updateParkingSpaces }) {
+function OperationsHub({ addClient, addDeployment, removeDeployment, removeDeploymentNow, assignments, assignDriver, clientHubs, driverSession, markTaskDone, openFleet, selected, selectVehicle, tasks, vehicles, parkings, addParking, updateParkingSpaces }) {
+  const [opsTab, setOpsTab] = useState('Deployments');
   return (
-    <div className="stacked-workspace">
-      <Deployments addClient={addClient} addDeployment={addDeployment} removeDeployment={removeDeployment} removeDeploymentNow={endDeploymentNow} clientHubs={clientHubs} vehicles={vehicles} parkings={parkings} />
-      <DriverAssignments
-        assignments={assignments}
-        assignDriver={assignDriver}
-        driverSession={driverSession}
-        selected={selected}
-        vehicles={vehicles}
-      />
-      <ParkingManager parkings={parkings} addParking={addParking} updateParkingSpaces={updateParkingSpaces} />
-      <OpsActionCenter tasks={tasks} markTaskDone={markTaskDone} selectVehicle={selectVehicle} openFleet={openFleet} />
-    </div>
+    <section className="operations-shell">
+      <div className="operations-tabs" role="tablist" aria-label="Operations navigation">
+        {['Deployments', 'Tasks'].map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            aria-selected={opsTab === tab}
+            className={opsTab === tab ? 'tab active' : 'tab'}
+            onClick={() => setOpsTab(tab)}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+      <div className="operations-content">
+        {opsTab === 'Deployments' && (
+          <div className="operations-grid">
+            <Deployments addClient={addClient} addDeployment={addDeployment} removeDeployment={removeDeployment} removeDeploymentNow={removeDeploymentNow} clientHubs={clientHubs} vehicles={vehicles} parkings={parkings} />
+            <div className="operations-side">
+              <DriverAssignments
+                assignments={assignments}
+                assignDriver={assignDriver}
+                driverSession={driverSession}
+                selected={selected}
+                vehicles={vehicles}
+              />
+              <ParkingManager parkings={parkings} addParking={addParking} updateParkingSpaces={updateParkingSpaces} />
+            </div>
+          </div>
+        )}
+        {opsTab === 'Tasks' && (
+          <OpsActionCenter tasks={tasks} markTaskDone={markTaskDone} selectVehicle={selectVehicle} openFleet={openFleet} />
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -945,14 +1106,6 @@ function AdminHub({ exportReport, range, rangeError, saveSettings, settingsState
     <div className="stacked-workspace">
       <AlertsPanel />
       <SettingsPanel settingsState={settingsState} saveSettings={saveSettings} />
-    </div>
-  );
-}
-
-function ReportsHub({ exportReport, range, rangeError, validateRange, vehicles }) {
-  return (
-    <div className="stacked-workspace">
-      <Reports vehicles={vehicles} range={range} validateRange={validateRange} rangeError={rangeError} exportReport={exportReport} />
     </div>
   );
 }
@@ -1002,64 +1155,181 @@ function DriverConsole({ assignments, driverSession, setDriverSession }) {
   );
 }
 
-function Overview({ vehicles, tasks }) {
-  const running = vehicles.filter((vehicle) => vehicle.status === 'Running').length;
+function Overview({ vehicles, tasks, clientHubs, parkings }) {
+  const [trendPeriod, setTrendPeriod] = useState('week');
+  const [carbonTrend, setCarbonTrend] = useState({ loading: true, points: [], error: '' });
   const pending = tasks.filter((task) => task.status === 'Pending').length;
+  const deployedVehicles = vehicles.filter(hasClientDeployment);
+  const activeClientCount = new Set(deployedVehicles.map((vehicle) => normalizeClientName(vehicle.client)).filter(Boolean)).size;
+  const activeVehicles = vehicles.filter((vehicle) => vehicle.status !== 'Offline').length;
+  const offlineVehicles = vehicles.filter((vehicle) => vehicle.status === 'Offline').length;
   const carbonSaved = vehicles.reduce((total, vehicle) => total + parseCarbonKg(vehicle.carbon), 0);
+  const distanceCovered = vehicles.reduce((total, vehicle) => total + numberFromValue(vehicle.todayDistance), 0);
+  const carbonPerKm = distanceCovered ? carbonSaved / distanceCovered : 0;
+  const vehiclesAtParking = countVehiclesAtParking(vehicles, clientHubs, parkings);
+  const trendPoints = carbonTrend.points;
+
+  useEffect(() => {
+    let cancelled = false;
+    setCarbonTrend((current) => ({ ...current, loading: true, error: '' }));
+    apiJson(`/api/carbon-trend?period=${trendPeriod}`)
+      .then((payload) => {
+        if (!cancelled) setCarbonTrend({ loading: false, points: payload.points || [], error: '' });
+      })
+      .catch((error) => {
+        if (!cancelled) setCarbonTrend({ loading: false, points: [], error: error.message || 'Unable to load trend.' });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [trendPeriod]);
+
   return (
-    <section className="overview-grid">
-      <MetricCard icon={Truck} label="Active EVs" value={vehicles.filter((vehicle) => vehicle.status !== 'Offline').length} />
-      <MetricCard icon={Zap} label="Running now" value={running} />
-      <MetricCard icon={CircleAlert} label="Pending ops tasks" value={pending} />
-      <MetricCard icon={Gauge} label="Carbon saved" value={carbonSaved ? `${formatNumber(carbonSaved)} kg` : 'Not available'} />
+    <section className="overview-workspace">
+      <div className="overview-grid">
+        <MetricCard icon={UsersRound} label="Onboarded clients" value={clientHubs.length} />
+        <MetricCard icon={UsersRound} label="Active clients" value={activeClientCount} />
+        <MetricCard icon={Truck} label="Vehicles deployed" value={deployedVehicles.length} />
+        <MetricCard icon={Zap} label="Vehicles active" value={activeVehicles} />
+        <MetricCard icon={CircleAlert} label="Vehicles offline" value={offlineVehicles} />
+        <MetricCard icon={MapPin} label="Vehicles at parking" value={vehiclesAtParking} />
+        <MetricCard icon={Gauge} label="Carbon saved today vs CNG" value={carbonSaved ? `${formatNumber(carbonSaved)} kg` : 'Not available'} />
+        <MetricCard icon={Route} label="Carbon saved per km" value={carbonPerKm ? `${formatNumber(carbonPerKm)} kg/km` : 'Not available'} />
+        <MetricCard icon={CircleAlert} label="Pending ops tasks" value={pending} />
+      </div>
+      <CarbonTrendPanel
+        period={trendPeriod}
+        setPeriod={setTrendPeriod}
+        points={trendPoints}
+        loading={carbonTrend.loading}
+        error={carbonTrend.error}
+      />
     </section>
   );
 }
 
-function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, statusFilter, setStatusFilter, vehicleStatusFilter, setVehicleStatusFilter, vehicleStatusOptions, modelFilter, setModelFilter, modelOptions, activeVehicleCount, offlineVehicleCount, query, setQuery, exportReport, mapConfig, parkings }) {
+function CarbonTrendPanel({ period, setPeriod, points, loading, error }) {
+  const hasData = points.some((point) => Number(point.value) > 0);
+  return (
+    <section className="trend-panel">
+      <div className="panel-title trend-title">
+        <div>
+          <h2>Carbon Saved Trend</h2>
+          <span>{period === 'week' ? 'Last 7 days' : period === 'month' ? 'Last 30 days' : 'Last 12 months'}</span>
+        </div>
+        <div className="trend-range">
+          {[
+            ['week', '7 days'],
+            ['month', 'Monthly'],
+            ['year', 'Yearly'],
+          ].map(([value, label]) => (
+            <button className={period === value ? 'active' : ''} key={value} type="button" onClick={() => setPeriod(value)}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {loading ? (
+        <div className="chart-empty">Loading carbon trend...</div>
+      ) : error ? (
+        <div className="chart-empty">Trend unavailable: {error}</div>
+      ) : hasData ? (
+        <CarbonTrendChart points={points} />
+      ) : (
+        <div className="chart-empty">No historical carbon records available yet. The chart will populate as scraper snapshots are stored.</div>
+      )}
+    </section>
+  );
+}
+
+function CarbonTrendChart({ points }) {
+  const width = 900;
+  const height = 260;
+  const padding = { top: 24, right: 22, bottom: 46, left: 58 };
+  const maxValue = Math.max(...points.map((point) => Number(point.value) || 0), 1);
+  const usableWidth = width - padding.left - padding.right;
+  const usableHeight = height - padding.top - padding.bottom;
+  const step = points.length > 1 ? usableWidth / (points.length - 1) : usableWidth;
+  const coords = points.map((point, index) => ({
+    x: padding.left + step * index,
+    y: padding.top + usableHeight - ((Number(point.value) || 0) / maxValue) * usableHeight,
+    value: Number(point.value) || 0,
+    label: point.label,
+  }));
+  const path = coords.map((point, index) => `${index ? 'L' : 'M'} ${point.x} ${point.y}`).join(' ');
+  const areaPath = `${path} L ${padding.left + step * (coords.length - 1)} ${padding.top + usableHeight} L ${padding.left} ${padding.top + usableHeight} Z`;
+  const labelEvery = points.length > 12 ? Math.ceil(points.length / 6) : 1;
+  return (
+    <div className="carbon-chart-wrap">
+      <svg className="carbon-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Carbon saved trend chart">
+        <line x1={padding.left} y1={padding.top} x2={padding.left} y2={padding.top + usableHeight} />
+        <line x1={padding.left} y1={padding.top + usableHeight} x2={width - padding.right} y2={padding.top + usableHeight} />
+        {[0, 0.5, 1].map((ratio) => {
+          const y = padding.top + usableHeight - ratio * usableHeight;
+          return (
+            <g key={ratio}>
+              <line className="chart-gridline" x1={padding.left} y1={y} x2={width - padding.right} y2={y} />
+              <text className="chart-y-label" x={padding.left - 12} y={y + 4}>{formatNumber(maxValue * ratio)}</text>
+            </g>
+          );
+        })}
+        <path className="chart-area" d={areaPath} />
+        <path className="chart-line" d={path} />
+        {coords.map((point, index) => (
+          <g key={`${point.label}-${index}`}>
+            <circle className="chart-point" cx={point.x} cy={point.y} r="4" />
+            {(index % labelEvery === 0 || index === coords.length - 1) && (
+              <text className="chart-x-label" x={point.x} y={height - 14}>{point.label}</text>
+            )}
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, activeVehicleCount, offlineVehicleCount, query, setQuery, mapConfig, parkings, driverContactByVehicle }) {
   return (
     <>
       <Toolbar
         statusFilter={statusFilter}
         setStatusFilter={setStatusFilter}
-        vehicleStatusFilter={vehicleStatusFilter}
-        setVehicleStatusFilter={setVehicleStatusFilter}
+        fleetFilters={fleetFilters}
+        setFleetFilters={setFleetFilters}
         vehicleStatusOptions={vehicleStatusOptions}
-        modelFilter={modelFilter}
-        setModelFilter={setModelFilter}
         modelOptions={modelOptions}
+        clientOptions={clientOptions}
         activeVehicleCount={activeVehicleCount}
         offlineVehicleCount={offlineVehicleCount}
         query={query}
         setQuery={setQuery}
-        exportReport={exportReport}
       />
       <section className="fleet-layout">
         <aside className="vehicle-list">
           {filteredVehicles.map((vehicle) => (
-            <VehicleCard key={vehicle.id} selected={selectedId === vehicle.id} vehicle={vehicle} onClick={() => setSelectedId(vehicle.id)} />
+            <VehicleCard key={vehicle.id} selected={selectedId === vehicle.id} vehicle={vehicle} driverContact={driverContactByVehicle?.get(vehicle.id)} onClick={() => setSelectedId(vehicle.id)} />
           ))}
         </aside>
         <div className="map-column">
           <FleetMap vehicles={filteredVehicles} selectedId={selectedId} setSelectedId={setSelectedId} mapConfig={mapConfig} parkings={parkings} />
-          <VehicleDetail vehicle={selected} parkings={parkings} />
+          <VehicleDetail vehicle={selected} parkings={parkings} driverContact={driverContactByVehicle?.get(selected?.id)} />
         </div>
       </section>
     </>
   );
 }
 
-function Toolbar({ statusFilter, setStatusFilter, vehicleStatusFilter, setVehicleStatusFilter, vehicleStatusOptions, modelFilter, setModelFilter, modelOptions, activeVehicleCount, offlineVehicleCount, query, setQuery, exportReport }) {
-  const scopedStatusOptions = vehicleStatusOptions.filter((status) => (
+function Toolbar({ statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, activeVehicleCount, offlineVehicleCount, query, setQuery }) {
+  const scopedStatusOptions = useMemo(() => vehicleStatusOptions.filter((status) => (
     statusFilter === 'Offline' ? status === 'Offline' : status !== 'Offline'
-  ));
+  )), [vehicleStatusOptions, statusFilter]);
   return (
     <section className="toolbar">
       <div className="status-toggle">
-        <button className={statusFilter === 'Active' ? 'pill active' : 'pill'} onClick={() => { setStatusFilter('Active'); setVehicleStatusFilter('All statuses'); }} type="button">
+        <button className={statusFilter === 'Active' ? 'pill active' : 'pill'} onClick={() => setStatusFilter('Active')} type="button">
           Active <span>{activeVehicleCount}</span>
         </button>
-        <button className={statusFilter === 'Offline' ? 'pill active' : 'pill'} onClick={() => { setStatusFilter('Offline'); setVehicleStatusFilter('All statuses'); }} type="button">
+        <button className={statusFilter === 'Offline' ? 'pill active' : 'pill'} onClick={() => setStatusFilter('Offline')} type="button">
           Offline <span>{offlineVehicleCount}</span>
         </button>
       </div>
@@ -1067,30 +1337,90 @@ function Toolbar({ statusFilter, setStatusFilter, vehicleStatusFilter, setVehicl
         <Search size={20} />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search..." />
       </label>
-      <div className="filter-controls">
-        <label className="filter-select">
-          <span>Status</span>
-          <select value={vehicleStatusFilter} onChange={(event) => setVehicleStatusFilter(event.target.value)}>
-            <option>All statuses</option>
-            {scopedStatusOptions.map((status) => <option key={status}>{status}</option>)}
-          </select>
-        </label>
-        <label className="filter-select">
-          <span>Model</span>
-          <select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}>
-            <option>All models</option>
-            {modelOptions.map((model) => <option key={model}>{model}</option>)}
-          </select>
-        </label>
-      </div>
-      <button className="export-button" type="button" onClick={exportReport}>
-        <Download size={18} /> Export All
-      </button>
+      <FleetFilterBar
+        fleetFilters={fleetFilters}
+        setFleetFilters={setFleetFilters}
+        clientOptions={clientOptions}
+        modelOptions={modelOptions}
+        statusOptions={scopedStatusOptions}
+      />
     </section>
   );
 }
 
-function VehicleCard({ vehicle, selected, onClick }) {
+function FleetFilterBar({ fleetFilters, setFleetFilters, clientOptions, modelOptions, statusOptions }) {
+  const [open, setOpen] = useState(false);
+  const activeCount = fleetFilters.clients.length + fleetFilters.models.length + fleetFilters.statuses.length;
+
+  useEffect(() => {
+    function onDocClick(event) {
+      if (!open) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('.filter-popover') || target.closest('.filter-trigger')) return;
+      setOpen(false);
+    }
+    document.addEventListener('click', onDocClick);
+    return () => document.removeEventListener('click', onDocClick);
+  }, [open]);
+
+  function toggleItem(field, value) {
+    setFleetFilters((current) => {
+      const values = new Set(current[field] || []);
+      if (values.has(value)) values.delete(value);
+      else values.add(value);
+      return { ...current, [field]: [...values] };
+    });
+  }
+
+  function clearAll() {
+    setFleetFilters({ clients: [], models: [], statuses: [] });
+  }
+
+  return (
+    <div className="fleet-filters">
+      <button className="filter-trigger" type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <Filter size={18} />
+        Filters{activeCount ? ` (${activeCount})` : ''}
+      </button>
+      {open && (
+        <div className="filter-popover" role="dialog" aria-label="Fleet filters">
+          <div className="filter-popover-head">
+            <strong>Filter fleet</strong>
+            <button className="ghost-link" type="button" onClick={clearAll} disabled={!activeCount}>Clear</button>
+          </div>
+          <div className="filter-popover-grid">
+            <FilterSection title="Clients" field="clients" options={clientOptions} selected={fleetFilters.clients} toggleItem={toggleItem} />
+            <FilterSection title="Model" field="models" options={modelOptions} selected={fleetFilters.models} toggleItem={toggleItem} />
+            <FilterSection title="Status" field="statuses" options={statusOptions} selected={fleetFilters.statuses} toggleItem={toggleItem} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FilterSection({ title, field, options, selected, toggleItem }) {
+  return (
+    <div className="filter-section">
+      <div className="filter-section-title">{title}</div>
+      <div className="filter-section-list" role="list">
+        {options.length ? options.map((option) => (
+          <label className="filter-check" key={`${field}-${option}`}>
+            <input type="checkbox" checked={selected.includes(option)} onChange={() => toggleItem(field, option)} />
+            <span title={option}>{option}</span>
+          </label>
+        )) : (
+          <div className="filter-empty">No options</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function VehicleCard({ vehicle, driverContact, selected, onClick }) {
+  const lastUpdatedLabel = formatRelativeTimestamp(vehicle.lastUpdated);
+  const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   return (
     <button className={selected ? 'vehicle-card selected' : 'vehicle-card'} type="button" onClick={onClick}>
       <div className="vehicle-card-top">
@@ -1103,6 +1433,10 @@ function VehicleCard({ vehicle, selected, onClick }) {
       <div className="split">
         <Info label="Client" value={safeValue(vehicle.client, 'Unassigned client')} />
         <Info label="Hub" value={safeValue(vehicle.hub, 'Unassigned hub')} />
+      </div>
+      <div className="split">
+        <Info label="Driver" value={safeValue(driverContact?.name || vehicle.driver, 'No driver')} />
+        <Info label="Driver email" value={safeValue(driverContact?.email, 'Not available')} />
       </div>
       <div className="battery-line">
         <div>
@@ -1118,11 +1452,11 @@ function VehicleCard({ vehicle, selected, onClick }) {
       </div>
       <div className="insight-grid">
         <Info label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} strong />
-        <Info label="Average speed" value={safeValue(vehicle.avgSpeed)} />
+        <Info label="Average speed" value={safeValue(avgSpeedLabel)} />
         <Info label="Energy today" value={safeValue(vehicle.energy)} />
         <Info label="Battery temp" value={safeValue(vehicle.temp)} />
       </div>
-      <Info label="Last update" value={safeValue(vehicle.lastUpdated)} />
+      <Info label="Last update" value={safeValue(lastUpdatedLabel)} />
     </button>
   );
 }
@@ -1241,7 +1575,7 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
               map: mapRef.current,
               position,
               title: marker.title,
-              icon: googleDotIcon(markerColor(marker), marker.selected),
+              icon: googleDotIcon(markerColor(marker), marker.selected, marker.kind),
               zIndex: markerZIndex(marker),
             });
             gmMarker.addListener('click', () => {
@@ -1332,13 +1666,18 @@ function dotMarkerNodeFor(marker) {
   markerNode.type = 'button';
   markerNode.title = marker.title;
   markerNode.setAttribute('aria-label', marker.title);
+  markerNode.innerHTML = '<span class="marker-icon" aria-hidden="true"></span>';
   return markerNode;
 }
 
-function googleDotIcon(fill, selected = false) {
-  const size = selected ? 22 : 16;
-  const radius = selected ? 8 : 6;
-  const svg = `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg"><circle cx="${size / 2}" cy="${size / 2}" r="${radius + 2}" fill="rgba(15,23,42,0.18)"/><circle cx="${size / 2}" cy="${size / 2}" r="${radius}" fill="${fill}" stroke="#ffffff" stroke-width="3"/></svg>`;
+function googleDotIcon(fill, selected = false, kind = 'vehicle') {
+  const size = selected ? 30 : 24;
+  const glyph = mapMarkerSvg(kind);
+  const svg = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="12" cy="12" r="10.5" fill="rgba(15,23,42,0.22)"/>
+    <circle cx="12" cy="12" r="9" fill="${fill}" stroke="#ffffff" stroke-width="2"/>
+    ${glyph}
+  </svg>`;
   return {
     url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
     scaledSize: new window.google.maps.Size(size, size),
@@ -1451,14 +1790,53 @@ function markerColor(marker) {
   return '#f5a400';
 }
 
+function mapMarkerSvg(kind) {
+  // Simple, high-contrast marker glyphs (kept minimal so they stay legible when zoomed out).
+  if (kind === 'hub') {
+    return '<path d="M7 10.5 12 7l5 3.5V18a1 1 0 0 1-1 1h-2.2v-4.2h-3.6V19H8a1 1 0 0 1-1-1v-7.5Z" fill=\"#fff\" opacity=\"0.95\"/>';
+  }
+  if (kind === 'parking') {
+    return '<path d="M9 7.6h3.9c2 0 3.3 1.2 3.3 3.1 0 2-1.3 3.2-3.3 3.2H11V19H9V7.6Zm2 1.8v2.7h1.7c1 0 1.6-.5 1.6-1.35S13.7 9.4 12.7 9.4H11Z" fill=\"#fff\" opacity=\"0.95\"/>';
+  }
+  // vehicle
+  return '<path d="M7.4 15.7a1.8 1.8 0 1 0 0 3.6 1.8 1.8 0 0 0 0-3.6Zm9.2 0a1.8 1.8 0 1 0 0 3.6 1.8 1.8 0 0 0 0-3.6ZM7.7 8.4h8.6c.7 0 1.3.4 1.6 1.1l1 2.4c.1.3.2.6.2.9V15a1 1 0 0 1-1 1h-.7a2.8 2.8 0 0 0-5.6 0H10.4a2.8 2.8 0 0 0-5.6 0H4a1 1 0 0 1-1-1v-2.2c0-.3.1-.6.2-.9l1-2.4c.3-.7.9-1.1 1.6-1.1Zm.3 2.1-.7 1.7h9.4l-.7-1.7H8Z" fill=\"#fff\" opacity=\"0.95\"/>';
+}
+
 function markerZIndex(marker) {
   if (marker.selected) return 40;
   if (marker.kind === 'vehicle') return 30;
   return 20;
 }
 
+function normalizeMapLink(link) {
+  const trimmed = String(link || '').trim();
+  if (!trimmed) return '';
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function mapLinkInfo(link) {
+  const normalized = normalizeMapLink(link);
+  if (!normalized) return { valid: false, coords: null, normalized, message: '' };
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (error) {
+    return { valid: false, coords: null, normalized, message: 'Enter a valid URL.' };
+  }
+  const host = parsed.hostname.toLowerCase();
+  const path = parsed.pathname.toLowerCase();
+  const isGoogleMapsHost = host === 'maps.app.goo.gl'
+    || host === 'goo.gl'
+    || host.startsWith('maps.google.')
+    || ((host === 'google.com' || host.startsWith('www.google.') || host.endsWith('.google.com')) && path.startsWith('/maps'));
+  const coords = extractMapCoords(normalized);
+  if (!isGoogleMapsHost) return { valid: false, coords, normalized, message: 'Only Google Maps links are accepted.' };
+  if (!coords) return { valid: false, coords: null, normalized, message: 'Open Google Maps, choose a place, then copy a link that contains coordinates.' };
+  return { valid: true, coords, normalized, message: 'Valid Google Maps link.' };
+}
+
 function extractMapCoords(link) {
-  const value = decodeURIComponent(String(link || ''));
+  const value = decodeURIComponent(normalizeMapLink(link));
   const atMatch = value.match(/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
   const bangMatch = value.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
   const queryMatch = value.match(/[?&](?:q|query|ll|destination)=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
@@ -1497,8 +1875,11 @@ function distanceMeters(a, b) {
   return 2 * earthRadiusMeters * Math.asin(Math.sqrt(h));
 }
 
-function VehicleDetail({ vehicle, parkings = [] }) {
+function VehicleDetail({ vehicle, parkings = [], driverContact }) {
   const parkingRecord = (parkings || []).find((p) => p.name === vehicle.parking);
+  const lastUpdatedLabel = formatRelativeTimestamp(vehicle.lastUpdated);
+  const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
+  const placeLabel = useNearPlaceLabel(vehicle?.lat, vehicle?.lng);
   return (
     <section className="detail-panel">
       <div className="detail-heading">
@@ -1518,24 +1899,25 @@ function VehicleDetail({ vehicle, parkings = [] }) {
       <div className="detail-tabs">
         <div>
           <h3>Now</h3>
-          <p>Current location: {safeValue(vehicle.location)}</p>
+          <p>Current location: {safeValue(placeLabel || vehicle.location)}</p>
           <p>Last stop: {safeValue(vehicle.lastStop)}</p>
           <p>Assigned parking: {safeValue(vehicle.parking)}{parkingRecord?.spacesLeft !== undefined ? ` · ${parkingRecord.spacesLeft} spaces left` : ''}</p>
-          <p>Average speed: {safeValue(vehicle.avgSpeed)}</p>
-          <p>Last update: {safeValue(vehicle.lastUpdated)}</p>
+          <p>Average speed: {safeValue(avgSpeedLabel)}</p>
+          <p>Last update: {safeValue(lastUpdatedLabel)}</p>
         </div>
         <div>
           <h3>Driver</h3>
           <p>{vehicle.driverState === 'active' ? 'Currently driven by' : vehicle.driverState === 'assigned' ? 'Assigned driver today' : vehicle.driverState === 'last' ? 'Last driven by' : 'Driver status'}</p>
           <strong>{vehicle.driver}</strong>
+          {driverContact?.email ? <p className="muted">Contact: {driverContact.email}</p> : null}
           <p>{vehicle.driverMeta}</p>
         </div>
         <div>
           <h3>Assignment</h3>
           <p>Parking: {vehicle.parking}</p>
           <p>Place status: {vehicle.locationState || 'Not assigned to a hub/parking geofence'}</p>
-          {vehicle.hubGmpLink && <p><a href={vehicle.hubGmpLink} target="_blank" rel="noreferrer">Open hub map link</a></p>}
-          {vehicle.parkingGmpLink && <p><a href={vehicle.parkingGmpLink} target="_blank" rel="noreferrer">Open parking map link</a></p>}
+          {vehicle.hubGmpLink && <p><ActionLink href={vehicle.hubGmpLink} icon={MapPin} label="Open hub map" /></p>}
+          {vehicle.parkingGmpLink && <p><ActionLink href={vehicle.parkingGmpLink} icon={ParkingCircle} label="Open parking map" /></p>}
           <p>Energy today: {safeValue(vehicle.energy)}</p>
           <p>Battery temperature: {safeValue(vehicle.temp)}</p>
           <p>Carbon basis: {safeValue(vehicle.confidence, 'Estimated vs CNG')}</p>
@@ -1545,10 +1927,41 @@ function VehicleDetail({ vehicle, parkings = [] }) {
   );
 }
 
+function ActionLink({ href, icon: Icon, label }) {
+  return (
+    <a className="action-link" href={href} target="_blank" rel="noreferrer">
+      <Icon size={18} />
+      <span>{label}</span>
+      <ExternalLink size={16} className="action-link-external" />
+    </a>
+  );
+}
+
 function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
   const [viewingClient, setViewingClient] = useState(null);
+  const [clientModalOpen, setClientModalOpen] = useState(false);
   const [newHubName, setNewHubName] = useState('');
   const [newHubLink, setNewHubLink] = useState('');
+  const [clientQuery, setClientQuery] = useState('');
+
+  const filteredClients = useMemo(() => {
+    const q = clientQuery.trim().toLowerCase();
+    if (!q) return clientHubs;
+    return clientHubs.filter((client) => {
+      const hubs = normalizeLocationRecords(client.hubs).map((h) => `${h.name} ${h.gmpLink}`).join(' ');
+      const parkings = normalizeLocationRecords(client.parkings).map((p) => `${p.name} ${p.gmpLink}`).join(' ');
+      const deployedCount = vehicles.filter((vehicle) => normalizeClientName(vehicle.client) === normalizeClientName(client.client) && hasClientDeployment(vehicle)).length;
+      const haystack = [
+        client.client,
+        client.gstNumber,
+        client.clientPoc,
+        hubs,
+        parkings,
+        String(deployedCount),
+      ].join(' ').toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [clientHubs, clientQuery, vehicles]);
 
   async function openClientHubs(client) {
     setViewingClient(client);
@@ -1575,14 +1988,27 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
     }
   }
 
+  async function handleAddClient(event) {
+    const saved = await addClient(event);
+    if (saved) {
+      setClientModalOpen(false);
+      if (refreshClientHubs) await refreshClientHubs();
+    }
+  }
+
   return (
     <section className="table-panel">
       <div className="panel-title">
-        <div>
+        <div className="panel-title-stack">
           <h2>Clients</h2>
+          <label className="search-box panel-search">
+            <Search size={18} />
+            <input value={clientQuery} onChange={(event) => setClientQuery(event.target.value)} placeholder="Search clients..." />
+          </label>
         </div>
+        <button className="primary-action compact-action" type="button" onClick={() => setClientModalOpen(true)}><Plus size={18} /> Add Client</button>
       </div>
-      {clientHubs.length ? (
+      {filteredClients.length ? (
         <div className="table-wrap">
           <table>
             <thead>
@@ -1593,10 +2019,11 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
                 <th>Hubs</th>
                 <th>Parking points</th>
                 <th>Vehicles deployed</th>
+                <th />
               </tr>
             </thead>
             <tbody>
-              {clientHubs.map((client) => {
+              {filteredClients.map((client) => {
                 const hubs = normalizeLocationRecords(client.hubs);
                 const parkings = normalizeLocationRecords(client.parkings);
                 const deployedCount = vehicles.filter((vehicle) => normalizeClientName(vehicle.client) === normalizeClientName(client.client) && hasClientDeployment(vehicle)).length;
@@ -1608,6 +2035,11 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
                     <td><button className="ghost-action" type="button" onClick={() => openClientHubs(client)}>{hubs.length}</button></td>
                     <td>{parkings.length}</td>
                     <td>{deployedCount}</td>
+                    <td>
+                      <button className="ghost-action compact-action" type="button" onClick={() => openClientHubs(client)} title="Edit client hubs/parking">
+                        <Pencil size={17} />
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
@@ -1615,42 +2047,358 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
           </table>
         </div>
       ) : (
-        <div className="empty-state">No reusable clients added yet.</div>
+        <div className="empty-state">{clientHubs.length ? 'No matching clients found.' : 'No reusable clients added yet.'}</div>
       )}
 
       {viewingClient && (
         <div className="modal-backdrop" role="presentation">
-          <div className="modal-card">
-            <div className="panel-title">
-              <h3>Hubs for {viewingClient.client}</h3>
-              <button className="ghost-action compact-action" type="button" onClick={() => setViewingClient(null)}>Close</button>
+          <div className="modal-card hub-modal">
+            <div className="panel-title hub-modal-title">
+              <div>
+                <span>Client locations</span>
+                <h3>Hubs for {viewingClient.client}</h3>
+              </div>
+              <button className="ghost-action compact-action" type="button" onClick={() => setViewingClient(null)}><X size={17} /> Close</button>
             </div>
-            <div style={{ display: 'grid', gap: 12 }}>
-              <div>
+            <div className="hub-modal-body">
+              <div className="hub-modal-section">
                 <strong>Hubs</strong>
-                <ul>
-                  {normalizeLocationRecords(viewingClient.hubs).map((h) => <li key={h.name}><a href={h.gmpLink} target="_blank" rel="noreferrer">{h.name}</a></li>)}
-                </ul>
+                <div className="location-list">
+                  {normalizeLocationRecords(viewingClient.hubs).map((h) => (
+                    <a className="location-link" key={h.name} href={h.gmpLink} target="_blank" rel="noreferrer">
+                      <MapPin size={17} />
+                      <span>{h.name}</span>
+                      <ExternalLink size={15} />
+                    </a>
+                  ))}
+                  {!normalizeLocationRecords(viewingClient.hubs).length && <span className="empty-location">No hubs added yet.</span>}
+                </div>
               </div>
-              <div>
+              <div className="hub-modal-section">
                 <strong>Parkings</strong>
-                <ul>
-                  {normalizeLocationRecords(viewingClient.parkings).map((p) => <li key={p.name}><a href={p.gmpLink} target="_blank" rel="noreferrer">{p.name}</a></li>)}
-                </ul>
+                <div className="location-list">
+                  {normalizeLocationRecords(viewingClient.parkings).map((p) => (
+                    <a className="location-link" key={p.name} href={p.gmpLink} target="_blank" rel="noreferrer">
+                      <MapPin size={17} />
+                      <span>{p.name}</span>
+                      <ExternalLink size={15} />
+                    </a>
+                  ))}
+                  {!normalizeLocationRecords(viewingClient.parkings).length && <span className="empty-location">No parking points added yet.</span>}
+                </div>
               </div>
-              <form onSubmit={addHubForClient} className="inline-form">
+              <form onSubmit={addHubForClient} className="hub-modal-form">
                 <label>New hub name<input value={newHubName} onChange={(e) => setNewHubName(e.target.value)} required /></label>
                 <label>Google Maps link<input value={newHubLink} onChange={(e) => setNewHubLink(e.target.value)} placeholder="https://maps.google.com/..." /></label>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button className="primary-action" type="submit">Add hub</button>
-                  <button className="ghost-action" type="button" onClick={() => { setNewHubName(''); setNewHubLink(''); }}>Clear</button>
+                <div className="hub-modal-actions">
+                  <button className="primary-action" type="submit"><Plus size={17} /> Add hub</button>
+                  <button className="ghost-action" type="button" onClick={() => { setNewHubName(''); setNewHubLink(''); }}><RefreshCw size={17} /> Clear</button>
                 </div>
               </form>
             </div>
           </div>
         </div>
       )}
+      {clientModalOpen && <ClientOnboardingModal addClient={handleAddClient} closeModal={() => setClientModalOpen(false)} />}
     </section>
+  );
+}
+
+function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDriverPhone }) {
+  const [driverModalOpen, setDriverModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [editPhone, setEditPhone] = useState('');
+  const [driverQuery, setDriverQuery] = useState('');
+
+  const currentVehicleByEmail = useMemo(() => {
+    const latest = new Map();
+    driverAssignments.forEach((assignment) => {
+      const email = normalizeClientName(assignment.email);
+      if (!email) return;
+      const time = new Date(assignment.updatedAt || assignment.createdAt || 0).getTime();
+      const prev = latest.get(email);
+      const prevTime = prev ? new Date(prev.updatedAt || prev.createdAt || 0).getTime() : -1;
+      if (time >= prevTime) latest.set(email, assignment);
+    });
+    const map = new Map();
+    latest.forEach((assignment, email) => {
+      const status = String(assignment.status || '').toLowerCase();
+      const session = String(assignment.sessionState || '').toLowerCase();
+      const active = session.includes('active') || status.includes('started') || status.includes('assigned');
+      map.set(email, active ? assignment.vehicle : '');
+    });
+    return map;
+  }, [driverAssignments]);
+
+  function beginEdit(driver) {
+    setEditing(driver);
+    setEditPhone(driver.phone || '');
+  }
+
+  async function saveEdit() {
+    if (!editing) return;
+    await updateDriverPhone(editing.driverId, editPhone);
+    setEditing(null);
+    setEditPhone('');
+  }
+
+  return (
+    <section className="table-panel">
+      <div className="panel-title">
+        <div className="panel-title-stack">
+          <h2>Drivers</h2>
+          <label className="search-box panel-search">
+            <Search size={18} />
+            <input value={driverQuery} onChange={(event) => setDriverQuery(event.target.value)} placeholder="Search drivers..." />
+          </label>
+        </div>
+        <button className="primary-action compact-action" type="button" onClick={() => setDriverModalOpen(true)}><Plus size={18} /> Add Driver</button>
+      </div>
+
+      {drivers.length ? (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Driver</th>
+                <th>Contact number</th>
+                <th>Email</th>
+                <th>License</th>
+                <th>DOB</th>
+                <th>Deployed vehicle</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {drivers.filter((driver) => {
+                const q = driverQuery.trim().toLowerCase();
+                if (!q) return true;
+                const emailKey = normalizeClientName(driver.email);
+                const deployedVehicle = currentVehicleByEmail.get(emailKey) || 'Not deployed';
+                const haystack = [
+                  driver.name,
+                  driver.phone,
+                  driver.email,
+                  driver.licenseNumber,
+                  driver.dob,
+                  deployedVehicle,
+                ].join(' ').toLowerCase();
+                return haystack.includes(q);
+              }).map((driver) => {
+                const emailKey = normalizeClientName(driver.email);
+                const deployedVehicle = currentVehicleByEmail.get(emailKey) || 'Not deployed';
+                return (
+                  <tr key={driver.driverId}>
+                    <td>{driver.name}</td>
+                    <td>{driver.phone}</td>
+                    <td>{driver.email}</td>
+                    <td>{driver.licenseNumber}</td>
+                    <td>{driver.dob}</td>
+                    <td>{deployedVehicle}</td>
+                    <td>
+                      <button className="ghost-action compact-action" type="button" onClick={() => beginEdit(driver)} title="Edit contact number">
+                        <Pencil size={17} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="empty-state">No drivers onboarded yet.</div>
+      )}
+
+      {driverModalOpen && <DriverOnboardingModal addDriver={addDriver} closeModal={() => setDriverModalOpen(false)} />}
+
+      {editing && (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal-card add-client-modal">
+            <div className="panel-title">
+              <h2>Edit Driver</h2>
+              <button className="ghost-action compact-action" type="button" onClick={() => setEditing(null)}><X size={17} /> Close</button>
+            </div>
+            <label>Driver<input value={editing.name} readOnly /></label>
+            <label>Contact number<input value={editPhone} onChange={(e) => setEditPhone(e.target.value)} type="tel" placeholder="+91 98765 43210" pattern="[0-9+()\\-\\s]{7,20}" required /></label>
+            <div className="modal-actions">
+              <button className="ghost-action" type="button" onClick={() => setEditing(null)}>Cancel</button>
+              <button className="primary-action" type="button" onClick={saveEdit}><Check size={18} /> Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ParkingHub({ parkings = [], addParkingSite, updateParkingSiteSpaces }) {
+  const [parkingModalOpen, setParkingModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [editSpaces, setEditSpaces] = useState('');
+  const [parkingQuery, setParkingQuery] = useState('');
+
+  const filtered = useMemo(() => {
+    const q = parkingQuery.trim().toLowerCase();
+    if (!q) return parkings;
+    return parkings.filter((p) => {
+      const haystack = [p.name, p.location, p.gmpLink, String(p.totalSpaces ?? ''), String(p.spacesLeft ?? '')].join(' ').toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [parkings, parkingQuery]);
+
+  function beginEdit(parking) {
+    setEditing(parking);
+    setEditSpaces(String(parking.totalSpaces ?? ''));
+  }
+
+  async function saveEdit() {
+    if (!editing) return;
+    await updateParkingSiteSpaces(editing.parkingId || editing.id, editSpaces);
+    setEditing(null);
+    setEditSpaces('');
+  }
+
+  return (
+    <section className="table-panel">
+      <div className="panel-title">
+        <div className="panel-title-stack">
+          <h2>Parking</h2>
+          <label className="search-box panel-search">
+            <Search size={18} />
+            <input value={parkingQuery} onChange={(event) => setParkingQuery(event.target.value)} placeholder="Search parking..." />
+          </label>
+        </div>
+        <button className="primary-action compact-action" type="button" onClick={() => setParkingModalOpen(true)}><Plus size={18} /> Add Parking</button>
+      </div>
+
+      {filtered.length ? (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Location</th>
+                <th>Spaces</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((p) => (
+                <tr key={p.parkingId || p.id}>
+                  <td>{p.name}</td>
+                  <td>
+                    {p.gmpLink ? (
+                      <a className="location-link compact" href={p.gmpLink} target="_blank" rel="noreferrer">Click here</a>
+                    ) : (
+                      'Not added'
+                    )}
+                  </td>
+                  <td>{p.totalSpaces ?? 0}</td>
+                  <td>
+                    <button className="ghost-action compact-action" type="button" onClick={() => beginEdit(p)} title="Edit spaces">
+                      <Pencil size={17} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="empty-state">{parkings.length ? 'No matching parking sites found.' : 'No parking sites onboarded yet.'}</div>
+      )}
+
+      {parkingModalOpen && <ParkingOnboardingModal addParkingSite={addParkingSite} closeModal={() => setParkingModalOpen(false)} />}
+
+      {editing && (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal-card add-client-modal">
+            <div className="panel-title">
+              <h2>Edit Parking</h2>
+              <button className="ghost-action compact-action" type="button" onClick={() => setEditing(null)}><X size={17} /> Close</button>
+            </div>
+            <label>Name<input value={editing.name} readOnly /></label>
+            <label>Google Maps link<input value={editing.gmpLink || ''} readOnly /></label>
+            <MapLinkPreview link={editing.gmpLink} />
+            <label>Number of spaces<input value={editSpaces} onChange={(e) => setEditSpaces(e.target.value)} type="number" min="0" required /></label>
+            <div className="modal-actions">
+              <button className="ghost-action" type="button" onClick={() => setEditing(null)}>Cancel</button>
+              <button className="primary-action" type="button" onClick={saveEdit}><Check size={18} /> Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ParkingOnboardingModal({ addParkingSite, closeModal }) {
+  const [formState, setFormState] = useState({ name: '', location: '', gmpLink: '', totalSpaces: 0 });
+  const [error, setError] = useState('');
+
+  function onChange(patch) {
+    setFormState((current) => ({ ...current, ...patch }));
+  }
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    setError('');
+    const info = mapLinkInfo(formState.gmpLink);
+    if (!info.valid) {
+      setError(info.message || 'Use a valid Google Maps link.');
+      return;
+    }
+    const ok = await addParkingSite(formState);
+    if (ok) closeModal();
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="modal-card client-hub-form add-client-modal" onSubmit={handleSubmit}>
+        <div className="panel-title">
+          <h2>Add Parking</h2>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
+        </div>
+        <label>Parking name<input value={formState.name} onChange={(e) => onChange({ name: e.target.value })} placeholder="Parking name" required /></label>
+        <label>Location<input value={formState.location} onChange={(e) => onChange({ location: e.target.value })} placeholder="Location label (e.g. Hosur)" required /></label>
+        <label>Google Maps link<input value={formState.gmpLink} onChange={(e) => onChange({ gmpLink: e.target.value })} placeholder="https://www.google.com/maps/..." required /></label>
+        <MapLinkPreview link={formState.gmpLink} />
+        <label>Number of spaces<input value={formState.totalSpaces} onChange={(e) => onChange({ totalSpaces: e.target.value })} type="number" min="0" required /></label>
+        {error ? <p className="form-note">{error}</p> : null}
+        <div className="modal-actions">
+          <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
+          <button className="primary-action" type="submit"><Plus size={18} /> Add Parking</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function DriverOnboardingModal({ addDriver, closeModal }) {
+  async function handleSubmit(event) {
+    const saved = await addDriver(event);
+    if (saved) closeModal();
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="modal-card client-hub-form add-client-modal" onSubmit={handleSubmit}>
+        <div className="panel-title">
+          <h2>Add Driver</h2>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
+        </div>
+        <label>Driver name<input name="name" placeholder="Full name" required /></label>
+        <label>Contact number<input name="phone" type="tel" placeholder="+91 98765 43210" pattern="[0-9+()\\-\\s]{7,20}" required /></label>
+        <label>Driver license number<input name="licenseNumber" placeholder="License number" required /></label>
+        <label>Date of birth<input name="dob" type="date" required /></label>
+        <label>Email ID<input name="email" type="email" placeholder="name@company.com" required /></label>
+        <div className="modal-actions">
+          <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
+          <button className="primary-action" type="submit"><Plus size={18} /> Add Driver</button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -1672,7 +2420,7 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
   const selectedParkingRecord = combinedParkings.find((parking) => parking.name === selectedParking) || combinedParkings[0];
   const selectedLayoverParkingRecord = combinedParkings.find((parking) => parking.name === selectedLayoverParking) || selectedParkingRecord;
   const vehicleEligible = canScheduleVehicleForDeployment(selectedVehicle);
-  const canDeploy = Boolean(vehicles.length && selectedVehicle && selectedClient && hubs.length && parkings.length);
+  const canDeploy = Boolean(vehicles.length && selectedVehicle && selectedClient && hubs.length && combinedParkings.length);
   const deployedVehicles = vehicles.filter(hasClientDeployment);
 
   useEffect(() => {
@@ -1739,7 +2487,7 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
         <input name="layoverParkingLng" type="hidden" value={selectedLayoverParkingRecord?.lng || ''} />
         <label>How this vehicle will be used<select name="usage"><option>Shipment support</option><option>Dedicated hub movement</option><option>Inter-hub movement</option><option>Hybrid use</option></select></label>
         <label>Project/Ops POC<input name="poc" placeholder="Responsible POC" required /></label>
-        {!canDeploy && <span className="form-note">Add a client with mapped hubs and parking, then choose a vehicle and set deploy time.</span>}
+        {!canDeploy && <span className="form-note">Add a client with mapped hubs and at least one parking source, then choose a vehicle and set deploy time.</span>}
         <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           <button className="primary-action" type="submit" disabled={!canDeploy}><Plus size={18} /> Save Deployment</button>
           <button className="ghost-action" type="button" disabled={!selectedVehicleId || !hasClientDeployment(selectedVehicle)} onClick={async () => {
@@ -1784,23 +2532,109 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
 }
 
 function ClientOnboardingModal({ addClient, closeModal }) {
+  const [poc, setPoc] = useState({ name: '', email: '', phone: '' });
+  const [hubs, setHubs] = useState([{ name: '', gmpLink: '' }]);
+  const [parkings, setParkings] = useState([]);
+
+  const updateHub = (index, patch) => setHubs((current) => current.map((hub, itemIndex) => (itemIndex === index ? { ...hub, ...patch } : hub)));
+  const updateParking = (index, patch) => setParkings((current) => current.map((parking, itemIndex) => (itemIndex === index ? { ...parking, ...patch } : parking)));
+  const removeParking = (index) => setParkings((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  const hubPayload = hubs.map((hub) => `${hub.name.trim()} | ${normalizeMapLink(hub.gmpLink)}`).join('\n');
+  const parkingPayload = parkings.map((parking) => `${parking.name.trim()} | ${normalizeMapLink(parking.gmpLink)} | ${parking.spaces ?? ''}`).join('\n');
+  const pocPayload = [poc.name, poc.email, poc.phone].map((value) => value.trim()).filter(Boolean).join(' | ');
+
   return (
     <div className="modal-backdrop" role="presentation">
-      <form className="modal-card client-hub-form" onSubmit={addClient}>
+      <form className="modal-card client-hub-form add-client-modal" onSubmit={addClient}>
         <div className="panel-title">
           <h2>Add Client</h2>
-          <button className="ghost-action compact-action" type="button" onClick={closeModal}>Close</button>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
         </div>
         <label>GST number<input name="gstNumber" placeholder="Client GST number" required /></label>
         <label>Client name<input name="client" placeholder="Client name" required /></label>
-        <label>Client POC<input name="clientPoc" placeholder="Name, phone or email" required /></label>
-        <label>Hubs + Google Maps links<textarea name="hubs" placeholder="Hub name | https://maps.google.com/..." rows="4" required /></label>
-        <label>Parking points + Google Maps links<textarea name="parkings" placeholder="Parking point | https://maps.google.com/..." rows="4" required /></label>
+        <div className="poc-grid">
+          <label>POC name<input name="pocName" value={poc.name} onChange={(event) => setPoc((current) => ({ ...current, name: event.target.value }))} placeholder="Contact person" required /></label>
+          <label>POC email<input name="pocEmail" value={poc.email} onChange={(event) => setPoc((current) => ({ ...current, email: event.target.value }))} type="email" placeholder="name@company.com" required /></label>
+          <label>POC phone<input name="pocPhone" value={poc.phone} onChange={(event) => setPoc((current) => ({ ...current, phone: event.target.value }))} type="tel" placeholder="+91 98765 43210" pattern="[0-9+()\\-\\s]{7,20}" required /></label>
+        </div>
+        <input type="hidden" name="clientPoc" value={pocPayload} readOnly />
+        <input type="hidden" name="hubs" value={hubPayload} />
+        <input type="hidden" name="parkings" value={parkingPayload} />
+        <div className="location-editor">
+          <div className="location-editor-title">
+            <strong>Hubs</strong>
+            <button className="ghost-action compact-action" type="button" onClick={() => setHubs((current) => [...current, { name: '', gmpLink: '' }])}><Plus size={16} /> Add hub</button>
+          </div>
+          {hubs.map((hub, index) => (
+            <LocationEditorCard
+              key={`hub-${index}`}
+              item={hub}
+              label="Hub"
+              onChange={(patch) => updateHub(index, patch)}
+              canRemove={hubs.length > 1}
+              onRemove={() => setHubs((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+            />
+          ))}
+        </div>
+        <div className="location-editor">
+          <div className="location-editor-title">
+            <strong>Parking</strong>
+            <button className="ghost-action compact-action" type="button" onClick={() => setParkings((current) => [...current, { name: '', gmpLink: '', spaces: 0 }])}><Plus size={16} /> Add parking</button>
+          </div>
+          {parkings.map((parking, index) => (
+            <LocationEditorCard
+              key={`parking-${index}`}
+              item={parking}
+              label="Parking"
+              withSpaces
+              onChange={(patch) => updateParking(index, patch)}
+              canRemove
+              onRemove={() => removeParking(index)}
+            />
+          ))}
+          {!parkings.length && <div className="empty-location">Parking is optional.</div>}
+        </div>
         <div className="modal-actions">
           <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
           <button className="primary-action" type="submit"><Plus size={18} /> Add Client</button>
         </div>
       </form>
+    </div>
+  );
+}
+
+function LocationEditorCard({ item, label, withSpaces = false, onChange, canRemove = false, onRemove }) {
+  return (
+    <article className="location-editor-card">
+      <div className="location-editor-fields">
+        <label>{label} name<input value={item.name} onChange={(event) => onChange({ name: event.target.value })} placeholder={`${label} name`} required /></label>
+        <label>Google Maps link<input value={item.gmpLink} onChange={(event) => onChange({ gmpLink: event.target.value })} placeholder="https://www.google.com/maps/..." required /></label>
+        {withSpaces && <label>Parking spaces<input value={item.spaces ?? ''} onChange={(event) => onChange({ spaces: event.target.value })} type="number" min="0" required /></label>}
+      </div>
+      <MapLinkPreview link={item.gmpLink} />
+      {canRemove && <button className="ghost-action compact-action remove-location" type="button" onClick={onRemove}><X size={16} /> Remove</button>}
+    </article>
+  );
+}
+
+function MapLinkPreview({ link }) {
+  const info = mapLinkInfo(link);
+  if (!String(link || '').trim()) {
+    return <div className="map-link-preview empty">Paste a Google Maps link to preview.</div>;
+  }
+  if (!info.valid) {
+    return (
+      <div className="map-link-preview invalid">
+        <CircleAlert size={16} />
+        <span>{info.message}</span>
+      </div>
+    );
+  }
+  const src = `https://www.google.com/maps?q=${info.coords.lat},${info.coords.lng}&z=16&output=embed`;
+  return (
+    <div className="map-link-preview valid">
+      <iframe title="Google Maps preview" src={src} loading="lazy" referrerPolicy="no-referrer-when-downgrade" />
+      <span><MapPin size={15} /> {info.coords.lat.toFixed(5)}, {info.coords.lng.toFixed(5)}</span>
     </div>
   );
 }
@@ -2154,8 +2988,8 @@ function parseLocationLines(value) {
   return String(value || '')
     .split(/\r?\n/)
     .map((line) => {
-      const [name = '', ...linkParts] = line.trim().split('|');
-      return { name: name.trim(), gmpLink: linkParts.join('|').trim() };
+      const [name = '', gmpLink = '', spaces = ''] = line.trim().split('|').map((part) => part.trim());
+      return { name, gmpLink, spaces };
     })
     .filter((item) => item.name || item.gmpLink);
 }
@@ -2163,6 +2997,32 @@ function parseLocationLines(value) {
 function parseCarbonKg(value) {
   const match = String(value || '').match(/-?\d+(?:\.\d+)?/);
   return match ? Number(match[0]) : 0;
+}
+
+function numberFromValue(value) {
+  const match = String(value ?? '').replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : 0;
+}
+
+function parkingLocationsFor(clientHubs = [], parkings = []) {
+  const clientParkingLocations = (clientHubs || [])
+    .flatMap((client) => normalizeLocationRecords(client.parkings))
+    .map((parking) => coordsFromFields(parking.lat, parking.lng) || extractMapCoords(parking.gmpLink))
+    .filter(Boolean);
+  const globalParkingLocations = (parkings || [])
+    .map((parking) => coordsFromFields(parking.lat, parking.lng) || extractMapCoords(parking.gmpLink))
+    .filter(Boolean);
+  return [...clientParkingLocations, ...globalParkingLocations];
+}
+
+function countVehiclesAtParking(vehicles = [], clientHubs = [], parkings = []) {
+  const parkingLocations = parkingLocationsFor(clientHubs, parkings);
+  if (!parkingLocations.length) return 0;
+  return vehicles.filter((vehicle) => {
+    const vehicleCoords = coordsFromFields(vehicle.lat, vehicle.lng);
+    if (!vehicleCoords) return false;
+    return parkingLocations.some((parking) => distanceMeters(vehicleCoords, parking) <= 100);
+  }).length;
 }
 
 function modelLabelFor(vehicle) {
@@ -2219,6 +3079,97 @@ function formatOdometer(value) {
   const number = Number(match[0].replace(/,/g, ''));
   if (!Number.isFinite(number)) return text;
   return `${number.toLocaleString(undefined, { maximumFractionDigits: 0 })} km`;
+}
+
+const reverseGeocodeCache = new Map();
+
+function useNearPlaceLabel(lat, lng) {
+  const coordsKey = Number.isFinite(lat) && Number.isFinite(lng) ? `${Number(lat).toFixed(4)},${Number(lng).toFixed(4)}` : '';
+  const [label, setLabel] = useState('');
+
+  useEffect(() => {
+    if (!coordsKey) return;
+    const cached = reverseGeocodeCache.get(coordsKey);
+    if (cached) {
+      setLabel(cached);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/reverse-geocode?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`)
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || payload.message || 'Reverse geocode failed');
+        return payload.place || '';
+      })
+      .then((place) => {
+        if (cancelled) return;
+        const formatted = place ? `Near ${place}` : '';
+        reverseGeocodeCache.set(coordsKey, formatted);
+        setLabel(formatted);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [coordsKey, lat, lng]);
+
+  return label;
+}
+
+function formatRelativeTimestamp(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (/ago$/i.test(text) || /^just now$/i.test(text) || /^unavailable$/i.test(text)) return text;
+  const time = new Date(text).getTime();
+  if (!Number.isFinite(time) || time <= 0) return text;
+  return relativeTimeFromNow(time);
+}
+
+function relativeTimeFromNow(timeMs) {
+  const diff = Date.now() - timeMs;
+  if (!Number.isFinite(diff)) return '';
+  const seconds = Math.max(0, Math.floor(diff / 1000));
+  if (seconds < 60) return 'less than a minute ago';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hr${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} day${days === 1 ? '' : 's'} ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months} month${months === 1 ? '' : 's'} ago`;
+  const years = Math.floor(months / 12);
+  return `${years} year${years === 1 ? '' : 's'} ago`;
+}
+
+function ensureAverageSpeed(avgSpeedValue, todayDistanceValue, runningTimeValue) {
+  const avgSpeedText = String(avgSpeedValue || '').trim();
+  if (avgSpeedText && !/unavailable/i.test(avgSpeedText) && !/nan/i.test(avgSpeedText)) return avgSpeedText;
+  const distanceKm = numberFromValue(todayDistanceValue);
+  const minutes = minutesFromRunningTime(runningTimeValue);
+  if (!distanceKm || !minutes) return avgSpeedText || 'Not available';
+  const hours = minutes / 60;
+  if (!hours) return avgSpeedText || 'Not available';
+  const kmph = distanceKm / hours;
+  if (!Number.isFinite(kmph) || kmph <= 0) return avgSpeedText || 'Not available';
+  return `${formatNumber(kmph)} km/h`;
+}
+
+function minutesFromRunningTime(value) {
+  if (value === undefined || value === null) return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const text = String(value).toLowerCase();
+  const numeric = Number(text);
+  if (Number.isFinite(numeric)) return numeric;
+  // Try to parse strings like "120 min", "2 hours", "1h 30m".
+  let minutes = 0;
+  const hrMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
+  if (hrMatch) minutes += Number(hrMatch[1]) * 60;
+  const hourWord = text.match(/(\d+(?:\.\d+)?)\s*hour/);
+  if (hourWord) minutes += Number(hourWord[1]) * 60;
+  const minMatch = text.match(/(\d+(?:\.\d+)?)\s*m(?![a-z])/);
+  if (minMatch) minutes += Number(minMatch[1]);
+  const minWord = text.match(/(\d+(?:\.\d+)?)\s*min/);
+  if (minWord) minutes += Number(minWord[1]);
+  return Number.isFinite(minutes) ? minutes : 0;
 }
 
 function clampNumber(value, min, max) {

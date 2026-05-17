@@ -8,6 +8,7 @@ from .config import load_settings
 from .scraper import AgenticIntellicarScraper
 from .sheets import GoogleSheetsAppender
 from .storage import CsvAppender
+from ..supabase_appender import build_supabase_appender_from_env
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -32,7 +33,7 @@ def main() -> None:
 
     settings = load_settings()
     scraper = AgenticIntellicarScraper(settings)
-    appender = (
+    appender = build_supabase_appender_from_env() or (
         GoogleSheetsAppender(
             settings.google_sheet_id,
             settings.google_sheet_name,

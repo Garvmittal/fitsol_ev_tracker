@@ -11,6 +11,7 @@ from src.euler_scraper.sheets import GoogleSheetsAppender
 from src.euler_scraper.storage import CsvAppender
 from src.intellicar_scraper.config import load_settings as load_intellicar_settings
 from src.intellicar_scraper.scraper import AgenticIntellicarScraper
+from src.supabase_appender import build_supabase_appender_from_env
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -42,7 +43,7 @@ def main() -> None:
         )
     )
 
-    appender = (
+    appender = build_supabase_appender_from_env() or (
         GoogleSheetsAppender(
             euler_settings.google_sheet_id,
             euler_settings.google_sheet_name,

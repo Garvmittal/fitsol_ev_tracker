@@ -1,0 +1,8 @@
+.venv
+data
+__pycache__
+*.pyc
+.env
+storage_state.json
+*.json
+*.log

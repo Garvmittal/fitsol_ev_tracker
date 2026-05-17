@@ -96,6 +96,31 @@ INTELLICAR_GOOGLE_WORKSHEET_GID=
 
 Leave worksheet gid values blank unless you specifically want to target an existing tab by gid.
 
+## Supabase Output (Recommended for Production)
+
+For the live dashboard, avoid using Google Sheets as the primary database once rows are growing every 10 minutes. Run the dashboard Supabase migrations, then set:
+
+```ini
+SCRAPER_STORAGE=supabase
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+SUPABASE_VEHICLE_TABLE=vehicles
+SUPABASE_SNAPSHOT_TABLE=vehicle_snapshots
+```
+
+With this mode, each scrape cycle:
+
+- upserts the latest row per vehicle into `vehicles` for fast dashboard loading
+- inserts every raw cycle into `vehicle_snapshots` for reports and history
+
+Run both scrapers together:
+
+```powershell
+python .\run_all_scrapers.py
+```
+
+For cloud hosting, build this folder's `Dockerfile` as an always-on worker service. The image includes Playwright's browser dependencies, so Euler's browser-based login flow can run in production.
+
 ## How Euler Extraction Works
 
 The scraper logs in, then visits these read-only portal pages:

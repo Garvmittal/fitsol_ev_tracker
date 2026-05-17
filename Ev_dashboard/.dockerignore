@@ -1,0 +1,12 @@
+node_modules
+dist
+uat-report
+test-results
+*.png
+.env
+service_account.json
+*.log
+New folder (6)/.venv
+New folder (6)/data
+New folder (6)/storage_state.json
+New folder (6)/*.json

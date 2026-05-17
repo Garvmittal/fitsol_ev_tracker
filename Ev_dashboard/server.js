@@ -19,8 +19,10 @@ const clientHubsSheetName = process.env.CLIENT_HUBS_SHEET_NAME || 'Client Hubs';
 const clientParkingsSheetName = process.env.CLIENT_PARKINGS_SHEET_NAME || 'Client Parkings';
 const deploymentsSheetName = process.env.DEPLOYMENTS_SHEET_NAME || 'Deployments';
 const driverAssignmentsSheetName = process.env.DRIVER_ASSIGNMENTS_SHEET_NAME || 'Driver Assignments';
+const driversSheetName = process.env.DRIVERS_SHEET_NAME || 'Drivers';
 const opsTasksSheetName = process.env.OPS_TASKS_SHEET_NAME || 'Ops Tasks';
 const dashboardSettingsSheetName = process.env.DASHBOARD_SETTINGS_SHEET_NAME || 'Dashboard Settings';
+const parkingSitesSheetName = process.env.PARKING_SITES_SHEET_NAME || 'Parking Sites';
 const defaultAdminEmail = normalizeEmail(process.env.DEFAULT_ADMIN_EMAIL);
 const defaultAdminName = process.env.DEFAULT_ADMIN_NAME || 'Admin User';
 const authRequired = process.env.AUTH_REQUIRED === 'true';
@@ -34,6 +36,8 @@ const evEnergyKwhPerKm = Number(process.env.EV_ENERGY_KWH_PER_KM || 0.22);
 const otpStore = new Map();
 const sessions = new Map();
 const useSupabase = process.env.USE_SUPABASE === 'true';
+const apiCacheSeconds = Number(process.env.API_CACHE_SECONDS || 30);
+const sheetRecordsCache = new Map();
 
 app.use(express.json());
 
@@ -55,6 +59,40 @@ app.get('/api/config', (_request, response) => {
       },
     },
   });
+});
+
+const reverseGeocodeCache = new Map();
+const reverseGeocodeTtlMs = 24 * 60 * 60 * 1000;
+
+app.get('/api/reverse-geocode', (request, response) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY;
+  const lat = Number(request.query.lat);
+  const lng = Number(request.query.lng);
+  if (!apiKey) return response.status(400).json({ error: 'GOOGLE_MAPS_API_KEY is not configured' });
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return response.status(400).json({ error: 'Valid lat and lng are required' });
+
+  const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
+  const cached = reverseGeocodeCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return response.json({ ok: true, place: cached.place });
+
+  Promise.resolve()
+    .then(async () => {
+      const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+      url.searchParams.set('latlng', `${lat},${lng}`);
+      url.searchParams.set('key', apiKey);
+      const res = await fetch(url.toString());
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.error_message || payload.error || 'Google geocode failed');
+      if (payload.status && payload.status !== 'OK' && payload.status !== 'ZERO_RESULTS') {
+        throw new Error(payload.error_message || `Google geocode returned ${payload.status}`);
+      }
+      const best = payload.results?.[0]?.formatted_address || '';
+      const place = best ? simplifyPlaceLabel(best) : '';
+      reverseGeocodeCache.set(key, { place, expiresAt: Date.now() + reverseGeocodeTtlMs });
+      return place;
+    })
+    .then((place) => response.json({ ok: true, place }))
+    .catch((error) => response.status(500).json({ error: 'Unable to reverse geocode', message: error.message }));
 });
 
 app.get('/api/auth/me', async (request, response) => {
@@ -100,12 +138,12 @@ app.post('/api/auth/verify-otp', (request, response) => {
     user: pending.user,
     expiresAt: Date.now() + sessionExpiryHours * 60 * 60 * 1000,
   });
-  response.setHeader('Set-Cookie', `kyoto_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionExpiryHours * 60 * 60}`);
+  response.setHeader('Set-Cookie', sessionCookie(token, sessionExpiryHours * 60 * 60));
   response.json({ user: pending.user });
 });
 
 app.post('/api/auth/logout', (_request, response) => {
-  response.setHeader('Set-Cookie', 'kyoto_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+  response.setHeader('Set-Cookie', sessionCookie('', 0));
   response.json({ ok: true });
 });
 
@@ -151,10 +189,12 @@ app.post('/api/client-hubs', requirePermission('deployments'), async (request, r
     if (!client) return response.status(400).json({ error: 'Client name is required' });
     if (!gstNumber) return response.status(400).json({ error: 'GST number is required' });
     if (!clientPoc) return response.status(400).json({ error: 'Client POC is required' });
+    if (!hubs.length) return response.status(400).json({ error: 'At least one hub is required' });
     if (hubs.some((hub) => !hub.name || !hub.gmpLink)) return response.status(400).json({ error: 'Every hub needs a name and Google Maps link' });
     if (parkings.some((parking) => !parking.name || !parking.gmpLink)) return response.status(400).json({ error: 'Every parking point needs a name and Google Maps link' });
-    if (hubs.some((hub) => hub.gmpLink && !extractMapCoords(hub.gmpLink))) return response.status(400).json({ error: 'Use Google Maps links with coordinates for each hub' });
-    if (parkings.some((parking) => parking.gmpLink && !extractMapCoords(parking.gmpLink))) return response.status(400).json({ error: 'Use Google Maps links with coordinates for each parking point' });
+    if (hubs.some((hub) => !isValidGoogleMapsLink(hub.gmpLink))) return response.status(400).json({ error: 'Use valid Google Maps links with coordinates for each hub' });
+    if (parkings.some((parking) => !isValidGoogleMapsLink(parking.gmpLink))) return response.status(400).json({ error: 'Use valid Google Maps links with coordinates for each parking point' });
+    if (parkings.some((parking) => normalizeParkingSpaces(parking.spaces) === null)) return response.status(400).json({ error: 'Parking spaces must be zero or more' });
     const sheets = await getSheetsClient();
     const hubHeaders = clientHubHeaders();
     const parkingHeaders = clientParkingHeaders();
@@ -179,8 +219,24 @@ app.post('/api/client-hubs', requirePermission('deployments'), async (request, r
       .filter((parking) => !existingParkingKeys.has(`${client.toLowerCase()}::${parking.name.toLowerCase()}`))
       .map((parking) => {
         const coords = extractMapCoords(parking.gmpLink) || {};
-        return [client, parking.name, parking.gmpLink, coords.lat || '', coords.lng || '', 'TRUE', createdAt];
+        const spaces = normalizeParkingSpaces(parking.spaces) ?? 0;
+        return [client, parking.name, parking.gmpLink, coords.lat || '', coords.lng || '', spaces, spaces, 'TRUE', createdAt];
       });
+    if (useSupabase) {
+      await upsertSupabaseClientLocations({
+        client,
+        gstNumber,
+        clientPoc,
+        hubs,
+        parkings,
+        existingKeys,
+        existingParkingKeys,
+        createdAt,
+      });
+      const nextHubRows = scopeRows(await getSheetRecords(sheets, clientHubsSheetName), request.user);
+      const nextParkingRows = scopeRows(await getSheetRecords(sheets, clientParkingsSheetName), request.user);
+      return response.json({ ok: true, clients: groupClientHubs(nextHubRows, nextParkingRows) });
+    }
     if (hubRows.length) {
       await sheets.spreadsheets.values.append({
         spreadsheetId,
@@ -275,21 +331,19 @@ app.post('/api/deployments', requirePermission('deployments'), async (request, r
       created_at: new Date().toISOString(),
     };
     await appendRecord(sheets, deploymentsSheetName, deploymentHeaders(), deployment);
-    const task = await createOpsTask(sheets, {
-      title: 'Park vehicle at assigned parking',
+    const tasks = await createDeploymentTasks(sheets, {
       vehicle,
       client,
       hub,
       parking,
+      layoverParking,
+      previousUndeployAt,
+      deployAt,
+      usage,
       poc,
-      due: deployAt || 'Deployment start time',
-      reason: previousUndeployAt
-        ? `${usage || 'Deployment'}; previous site undeploy ${previousUndeployAt}; layover at ${layoverParking}`
-        : `${usage || 'Deployment'}; layover at ${layoverParking}`,
-      status: 'Pending',
-      created_by: request.user.email || request.user.name,
+      createdBy: request.user.email || request.user.name,
     });
-    response.json({ ok: true, deployment: normalizeDeploymentRow(deployment), task });
+    response.json({ ok: true, deployment: normalizeDeploymentRow(deployment), tasks });
   } catch (error) {
     response.status(500).json({ error: 'Unable to save deployment', message: error.message });
   }
@@ -379,6 +433,140 @@ app.post('/api/driver-assignments', requirePermission('drivers'), async (request
   }
 });
 
+app.get('/api/drivers', requirePermission('drivers'), async (request, response) => {
+  try {
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, driversSheetName, driverHeaders());
+    const rows = await getSheetRecords(sheets, driversSheetName);
+    response.json({ drivers: rows.map(normalizeDriverRow).reverse() });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to load drivers', message: error.message });
+  }
+});
+
+app.post('/api/drivers', requirePermission('drivers'), async (request, response) => {
+  try {
+    const driver = {
+      driver_id: crypto.randomUUID(),
+      name: String(request.body?.name || '').trim(),
+      phone: String(request.body?.phone || '').trim(),
+      license_number: String(request.body?.licenseNumber || '').trim(),
+      dob: String(request.body?.dob || '').trim(),
+      email: normalizeEmail(request.body?.email),
+      created_by: request.user.email || request.user.name,
+      created_at: new Date().toISOString(),
+      updated_at: '',
+    };
+    if (!driver.name || !driver.phone || !driver.license_number || !driver.dob || !driver.email) {
+      return response.status(400).json({ error: 'Name, phone, license number, DOB, and email are required' });
+    }
+
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, driversSheetName, driverHeaders());
+    await appendRecord(sheets, driversSheetName, driverHeaders(), driver);
+    const rows = await getSheetRecords(sheets, driversSheetName);
+    response.json({ ok: true, drivers: rows.map(normalizeDriverRow).reverse() });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to save driver', message: error.message });
+  }
+});
+
+app.patch('/api/drivers/:driverId', requirePermission('drivers'), async (request, response) => {
+  try {
+    const driverId = String(request.params.driverId || '').trim();
+    const phone = String(request.body?.phone || '').trim();
+    if (!driverId) return response.status(400).json({ error: 'Driver id is required' });
+    if (!phone) return response.status(400).json({ error: 'Phone is required' });
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, driversSheetName, driverHeaders());
+    const result = await updateSheetRowById(
+      sheets,
+      driversSheetName,
+      'driver_id',
+      driverId,
+      { phone, updated_at: new Date().toISOString() },
+      () => true,
+    );
+    if (!result) return response.status(404).json({ error: 'Driver not found' });
+    const rows = await getSheetRecords(sheets, driversSheetName);
+    response.json({ ok: true, drivers: rows.map(normalizeDriverRow).reverse() });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to update driver', message: error.message });
+  }
+});
+
+app.get('/api/parking-sites', requirePermission('deployments'), async (request, response) => {
+  try {
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, parkingSitesSheetName, parkingSiteHeaders());
+    const rows = await getSheetRecords(sheets, parkingSitesSheetName);
+    response.json({ parkings: rows.map(normalizeParkingSiteRow).reverse() });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to load parking sites', message: error.message });
+  }
+});
+
+app.post('/api/parking-sites', requirePermission('deployments'), async (request, response) => {
+  try {
+    const name = String(request.body?.name || '').trim();
+    const location = String(request.body?.location || '').trim();
+    const gmpLink = String(request.body?.gmpLink || '').trim();
+    const spaces = normalizeParkingSpaces(request.body?.totalSpaces);
+    if (!name) return response.status(400).json({ error: 'Parking name is required' });
+    if (!location) return response.status(400).json({ error: 'Location is required' });
+    if (!gmpLink) return response.status(400).json({ error: 'Google Maps link is required' });
+    if (!isValidGoogleMapsLink(gmpLink)) return response.status(400).json({ error: 'Use a valid Google Maps link with coordinates' });
+    if (spaces === null) return response.status(400).json({ error: 'Spaces must be zero or more' });
+
+    const coords = extractMapCoords(gmpLink) || {};
+    const record = {
+      parking_id: crypto.randomUUID(),
+      name,
+      location,
+      gmp_link: gmpLink,
+      lat: coords.lat || '',
+      lng: coords.lng || '',
+      total_spaces: spaces ?? 0,
+      created_by: request.user.email || request.user.name,
+      created_at: new Date().toISOString(),
+      updated_at: '',
+    };
+
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, parkingSitesSheetName, parkingSiteHeaders());
+    await appendRecord(sheets, parkingSitesSheetName, parkingSiteHeaders(), record);
+    const rows = await getSheetRecords(sheets, parkingSitesSheetName);
+    response.json({ ok: true, parkings: rows.map(normalizeParkingSiteRow).reverse() });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to save parking site', message: error.message });
+  }
+});
+
+app.patch('/api/parking-sites/:parkingId', requirePermission('deployments'), async (request, response) => {
+  try {
+    const parkingId = String(request.params.parkingId || '').trim();
+    const spaces = normalizeParkingSpaces(request.body?.totalSpaces);
+    if (!parkingId) return response.status(400).json({ error: 'Parking id is required' });
+    if (spaces === null) return response.status(400).json({ error: 'Spaces must be zero or more' });
+
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, parkingSitesSheetName, parkingSiteHeaders());
+    const result = await updateSheetRowById(
+      sheets,
+      parkingSitesSheetName,
+      'parking_id',
+      parkingId,
+      { total_spaces: spaces ?? 0, updated_at: new Date().toISOString() },
+      () => true,
+    );
+    if (!result) return response.status(404).json({ error: 'Parking site not found' });
+    const rows = await getSheetRecords(sheets, parkingSitesSheetName);
+    response.json({ ok: true, parkings: rows.map(normalizeParkingSiteRow).reverse() });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to update parking site', message: error.message });
+  }
+});
+
 app.post('/api/driver-session', requirePermission('driver'), async (request, response) => {
   try {
     const assignmentId = String(request.body?.assignmentId || '').trim();
@@ -448,19 +636,54 @@ app.post('/api/settings', requirePermission('alerts'), async (request, response)
   }
 });
 
+app.get('/api/carbon-trend', requirePermission('fleet'), async (request, response) => {
+  try {
+    const period = normalizeTrendPeriod(request.query?.period);
+    const sheets = await getSheetsClient();
+    const settings = await getDashboardSettings(sheets);
+    const records = scopeRows(await getCarbonTrendRecords(sheets, period), request.user);
+    response.json({ period, unit: 'kgCO2e', points: buildCarbonTrend(records, period, settings) });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to load carbon trend', message: error.message });
+  }
+});
+
 function parseHubInput(value) {
   return String(value || '')
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => {
-        const [name = '', ...linkParts] = line.split('|');
-        return { name: name.trim(), gmpLink: linkParts.join('|').trim() };
+        const [name = '', gmpLink = '', spaces = ''] = line.split('|').map((part) => part.trim());
+        return { name, gmpLink: normalizeMapLink(gmpLink), spaces };
       });
 }
 
+function normalizeMapLink(link) {
+  const trimmed = String(link || '').trim();
+  if (!trimmed) return '';
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function isValidGoogleMapsLink(link) {
+  const normalized = normalizeMapLink(link);
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (error) {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase();
+  const path = parsed.pathname.toLowerCase();
+  const isGoogleMapsHost = host === 'maps.app.goo.gl'
+    || host === 'goo.gl'
+    || host.startsWith('maps.google.')
+    || ((host === 'google.com' || host.startsWith('www.google.') || host.endsWith('.google.com')) && path.startsWith('/maps'));
+  return isGoogleMapsHost && Boolean(extractMapCoords(normalized));
+}
+
 function extractMapCoords(link) {
-  const value = decodeURIComponent(String(link || ''));
+  const value = decodeURIComponent(normalizeMapLink(link));
   const atMatch = value.match(/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
   const bangMatch = value.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
   const queryMatch = value.match(/[?&](?:q|query|ll|destination)=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
@@ -469,6 +692,12 @@ function extractMapCoords(link) {
   const lat = Number(match[1]);
   const lng = Number(match[2]);
   return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+}
+
+function normalizeParkingSpaces(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const spaces = Number(value);
+  return Number.isFinite(spaces) && spaces >= 0 ? Math.floor(spaces) : null;
 }
 
 app.get('/api/alerts/preview', requirePermission('alerts'), async (request, response) => {
@@ -508,7 +737,17 @@ app.post('/api/alerts/send', requirePermission('alerts'), async (request, respon
 
 const distPath = path.resolve('dist');
 if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
+  app.use(express.static(distPath, {
+    etag: true,
+    maxAge: 0,
+    setHeaders(response, filePath) {
+      if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+        response.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      } else if (filePath.endsWith('.html')) {
+        response.setHeader('Cache-Control', 'no-cache');
+      }
+    },
+  }));
   app.get(/.*/, (_request, response) => {
     response.sendFile(path.join(distPath, 'index.html'));
   });
@@ -517,47 +756,55 @@ if (fs.existsSync(distPath)) {
 function normalizeFleetRecords(records, settings = defaultSettings()) {
   const latestByVehicle = new Map();
   for (const record of records) {
-    const vehicleNumber = String(record.vehicle_number || '').trim();
+    const vehicleNumber = vehicleIdFromRecord(record);
     if (!vehicleNumber) continue;
-    const currentTime = new Date(record.vehicle_updated_at || record.scraped_at || 0).getTime() || 0;
-    const previous = latestByVehicle.get(vehicleNumber);
-    const previousTime = previous ? new Date(previous.vehicle_updated_at || previous.scraped_at || 0).getTime() || 0 : -1;
-    if (currentTime >= previousTime) latestByVehicle.set(vehicleNumber, record);
+    const key = vehicleNumber.toUpperCase();
+    const currentTime = recordTimeMs(record);
+    const previous = latestByVehicle.get(key);
+    const previousTime = previous ? recordTimeMs(previous) : -1;
+    if (currentTime >= previousTime) latestByVehicle.set(key, record);
   }
 
   return [...latestByVehicle.values()]
     .map((record) => {
-      const battery = toNumber(record.battery_percent);
-      const lat = toNumber(record.latitude);
-      const lng = toNumber(record.longitude);
-      const todayDistance = toNumber(record.distance_today_km);
-      const energyToday = toNumber(record.energy_today_kwh);
+      const vehicleNumber = vehicleIdFromRecord(record);
+      const battery = optionalNumber(record, 'battery_percent', 'battery%', 'battery', 'soc');
+      const lat = optionalNumber(record, 'latitude', 'lat');
+      const lng = optionalNumber(record, 'longitude', 'lng', 'long', 'lon');
+      const todayDistance = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+      const energyToday = optionalNumber(record, 'energy_today_kwh', 'energy consumed', 'energy') ?? 0;
+      const runningMinutes = optionalNumber(record, 'today_running_minutes', 'time today', 'running_minutes');
+      const avgSpeed = field(record, 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'avg_speed');
+      const temp = field(record, 'battery_temperature_c', 'temp', 'temperature');
+      const odometer = field(record, 'odometer_km', 'odometer');
+      const locationText = field(record, 'location_text', 'location', 'last_location');
+      const lastUpdated = field(record, 'vehicle_updated_at', 'last_updated', 'updated_at', 'scraped_at');
       const carbonSaved = carbonSavedVsCng(todayDistance, energyToday, settings);
       return {
-        id: record.vehicle_number,
-        model: record.vehicle_model || record.model || record.make_model || '',
-        sourceSystem: record.source_system || 'Unknown',
-        client: record.client || record.group_names || 'Unassigned client',
-        hub: record.hub || 'Unassigned hub',
-        parking: record.parking || 'Parking unavailable',
-        status: normalizeStatus(record.movement_status_raw || record.vehicle_status_raw || record.charging_status_raw),
-        battery: battery > 100 ? 0 : battery,
+        id: vehicleNumber,
+        model: field(record, 'vehicle_model', 'vehicle model/model', 'model', 'make_model') || 'Unspecified model',
+        sourceSystem: field(record, 'source_system', 'source') || 'Unknown',
+        client: field(record, 'client', 'group_names', 'account_username') || 'Unassigned client',
+        hub: field(record, 'hub') || 'Unassigned hub',
+        parking: field(record, 'parking') || 'Parking unavailable',
+        status: normalizeStatus(field(record, 'movement_status_raw', 'vehicle_status_raw', 'charging_status_raw', 'current status of vehicle', 'status')),
+        battery: battery && battery <= 100 ? Math.round(battery) : 0,
         distance: 0,
         todayDistance,
-        runningTime: minutesLabel(record.today_running_minutes),
-        avgSpeed: record.today_avg_speed_kmph ? `${record.today_avg_speed_kmph} km/h` : 'Unavailable',
-        temp: record.battery_temperature_c ? `${record.battery_temperature_c} C` : 'Unavailable',
-        odometer: record.odometer_km ? `${record.odometer_km} km` : 'Unavailable',
-        energy: energyToday ? `${energyToday} kWh` : 'Unavailable',
-        eta: 'Unavailable',
-        etaDate: '',
-        lastUpdated: record.vehicle_updated_at || record.scraped_at || 'Unavailable',
-        driverState: 'none',
-        driver: 'No driver confirmed yet',
-        driverMeta: 'Driver sessions not connected yet',
-        route: record.location_text || 'Route unavailable',
-        location: record.location_text || `${lat || ''}${lat && lng ? ', ' : ''}${lng || ''}` || 'Location unavailable',
-        lastStop: record.last_stop_location_text || 'Last stop unavailable',
+        runningTime: field(record, 'running_time', 'runningTime') || minutesLabel(runningMinutes),
+        avgSpeed: formatWithUnit(avgSpeed, 'km/h'),
+        temp: formatWithUnit(temp, 'C'),
+        odometer: formatWithUnit(odometer, 'km'),
+        energy: formatWithUnit(energyToday, 'kWh'),
+        eta: field(record, 'eta') || 'Unavailable',
+        etaDate: field(record, 'eta_date') || '',
+        lastUpdated: lastUpdated || 'Unavailable',
+        driverState: field(record, 'driver_state') || 'none',
+        driver: field(record, 'driver', 'active_driver', 'assigned_driver') || 'No driver confirmed yet',
+        driverMeta: field(record, 'driver_meta') || 'Driver sessions not connected yet',
+        route: locationText || field(record, 'route') || 'Route unavailable',
+        location: locationText || coordinateLabel(lat, lng) || 'Location unavailable',
+        lastStop: field(record, 'last_stop_location_text', 'last stop', 'last_stop') || 'Last stop unavailable',
         carbon: carbonSaved === null ? 'Unavailable' : `${carbonSaved.toFixed(1)} kgCO2e`,
         confidence: carbonSaved === null ? 'Unavailable' : 'Estimated vs CNG',
         lat,
@@ -565,6 +812,54 @@ function normalizeFleetRecords(records, settings = defaultSettings()) {
       };
     })
     .filter((vehicle) => Number.isFinite(vehicle.lat) && Number.isFinite(vehicle.lng));
+}
+
+function field(record, ...keys) {
+  const sources = [record, record?.metadata].filter(Boolean);
+  for (const source of sources) {
+    for (const key of keys) {
+      const value = source[key];
+      if (isMeaningful(value)) return value;
+    }
+  }
+  return '';
+}
+
+function isMeaningful(value) {
+  if (value === undefined || value === null) return false;
+  const text = String(value).trim();
+  return Boolean(text) && !['N/A', 'Unavailable', 'undefined', 'null', 'NaN'].includes(text);
+}
+
+function optionalNumber(record, ...keys) {
+  const value = field(record, ...keys);
+  if (!isMeaningful(value)) return undefined;
+  const number = Number(String(value).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/)?.[0] ?? value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function vehicleIdFromRecord(record) {
+  return String(field(record, 'vehicle_number', 'Vehcile_no', 'vehicle_no', 'vehicle_id', 'id', 'vehicle', 'registration') || '').trim().toUpperCase();
+}
+
+function recordTimeMs(record) {
+  const value = field(record, 'vehicle_updated_at', 'last_updated', 'updated_at', 'scraped_at', 'created_at');
+  const time = new Date(value || 0).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+function formatWithUnit(value, unit) {
+  if (!isMeaningful(value)) return 'Unavailable';
+  const text = String(value).trim();
+  if (/[a-z%]/i.test(text)) return text;
+  const number = Number(text);
+  if (!Number.isFinite(number)) return text;
+  return `${number} ${unit}`;
+}
+
+function coordinateLabel(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return '';
+  return `${lat}, ${lng}`;
 }
 
 async function getFleetRecords(sheets) {
@@ -634,11 +929,19 @@ function clientHubHeaders() {
 }
 
 function clientParkingHeaders() {
-  return ['client', 'parking', 'parking_gmp_link', 'parking_lat', 'parking_lng', 'active', 'created_at'];
+  return ['client', 'parking', 'parking_gmp_link', 'parking_lat', 'parking_lng', 'total_spaces', 'spaces_left', 'active', 'created_at'];
 }
 
 function driverAssignmentHeaders() {
   return ['assignment_id', 'name', 'email', 'vehicle', 'client', 'hub', 'shift_date', 'shift', 'status', 'session_state', 'created_by', 'created_at', 'updated_at'];
+}
+
+function driverHeaders() {
+  return ['driver_id', 'name', 'phone', 'license_number', 'dob', 'email', 'created_by', 'created_at', 'updated_at'];
+}
+
+function parkingSiteHeaders() {
+  return ['parking_id', 'name', 'location', 'gmp_link', 'lat', 'lng', 'total_spaces', 'created_by', 'created_at', 'updated_at'];
 }
 
 function opsTaskHeaders() {
@@ -691,6 +994,71 @@ function normalizeDriverAssignmentRow(row) {
   };
 }
 
+function normalizeDriverRow(row) {
+  return {
+    driverId: row.driver_id || row.driverId || '',
+    name: row.name || '',
+    phone: row.phone || '',
+    licenseNumber: row.license_number || row.licenseNumber || '',
+    dob: row.dob || '',
+    email: normalizeEmail(row.email || ''),
+    createdAt: row.created_at || '',
+    updatedAt: row.updated_at || '',
+  };
+}
+
+function normalizeParkingSiteRow(row) {
+  const totalSpaces = toNumber(row.total_spaces) ?? 0;
+  return {
+    parkingId: row.parking_id || row.parkingId || '',
+    name: row.name || '',
+    location: row.location || '',
+    gmpLink: row.gmp_link || row.gmpLink || row['Google Maps Link'] || '',
+    lat: toNumber(row.lat),
+    lng: toNumber(row.lng),
+    totalSpaces,
+    spacesLeft: totalSpaces,
+    createdAt: row.created_at || '',
+    updatedAt: row.updated_at || '',
+  };
+}
+
+async function createDeploymentTasks(sheets, deployment) {
+  await ensureSheetWithHeaders(sheets, opsTasksSheetName, opsTaskHeaders());
+  const reason = deployment.previousUndeployAt
+    ? `${deployment.usage || 'Deployment'}; previous site undeploy ${deployment.previousUndeployAt}; layover at ${deployment.layoverParking}`
+    : `${deployment.usage || 'Deployment'}; layover at ${deployment.layoverParking}`;
+
+  const due = deployment.deployAt || 'Deployment start time';
+  const base = {
+    vehicle: deployment.vehicle,
+    client: deployment.client,
+    hub: deployment.hub,
+    parking: deployment.parking,
+    poc: deployment.poc,
+    due,
+    reason,
+    status: 'Pending',
+    created_by: deployment.createdBy || '',
+  };
+
+  const titles = [
+    'Confirm deployment details with client POC',
+    'Park vehicle at assigned parking',
+    'Assign driver and confirm shift start',
+    deployment.layoverParking && deployment.layoverParking !== deployment.parking ? `Confirm layover parking readiness (${deployment.layoverParking})` : '',
+    deployment.previousUndeployAt ? 'End previous deployment and log undeploy time' : '',
+  ].filter(Boolean);
+
+  const tasks = [];
+  for (const title of titles) {
+    // eslint-disable-next-line no-await-in-loop
+    const task = await createOpsTask(sheets, { ...base, title });
+    tasks.push(task);
+  }
+  return tasks;
+}
+
 function normalizeTaskRow(row) {
   return {
     id: row.task_id || row.id || '',
@@ -716,10 +1084,14 @@ async function appendRecord(sheets, sheetTitle, headers, record) {
   if (useSupabase) {
     const db = (sheets && sheets.supabase) || supabaseModule.getClient();
     try {
-      const table = String(sheetTitle).toLowerCase().replace(/\s+/g, '_');
+      const table = tableForSheetTitle(sheetTitle);
       const payload = {};
-      for (const h of headers) payload[h] = record[h] ?? record[h.toLowerCase()] ?? '';
+      for (const h of headers) {
+        const value = record[h] ?? record[h.toLowerCase()];
+        if (value !== undefined && value !== '') payload[h] = value;
+      }
       await db.from(table).insert(payload);
+      clearRecordsCache(sheetTitle);
       return;
     } catch (err) {
       console.error('Supabase appendRecord error', err.message || err);
@@ -732,6 +1104,24 @@ async function appendRecord(sheets, sheetTitle, headers, record) {
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [headers.map((header) => record[header] ?? '')] },
   });
+  clearRecordsCache(sheetTitle);
+}
+
+function clearRecordsCache(sheetTitle) {
+  for (const key of sheetRecordsCache.keys()) {
+    if (key.endsWith(`:${sheetTitle}`)) sheetRecordsCache.delete(key);
+  }
+}
+
+function tableForSheetTitle(sheetTitle) {
+  if (sheetTitle === authUsersSheetName || sheetTitle === alertRecipientsSheetName) return 'users';
+  if (sheetTitle === clientHubsSheetName) return 'hubs';
+  if (sheetTitle === clientParkingsSheetName) return 'parkings';
+  if (sheetTitle === deploymentsSheetName) return 'deployments';
+  if (sheetTitle === driverAssignmentsSheetName) return 'driver_assignments';
+  if (sheetTitle === opsTasksSheetName) return 'ops_tasks';
+  if (sheetTitle === dashboardSettingsSheetName) return 'settings';
+  return String(sheetTitle || '').toLowerCase().replace(/\s+/g, '_');
 }
 
 async function createOpsTask(sheets, taskInput) {
@@ -819,7 +1209,7 @@ async function updateSheetRowById(sheets, sheetTitle, idHeader, idValue, patch, 
   if (useSupabase) {
     const db = (sheets && sheets.supabase) || supabaseModule.getClient();
     try {
-      const table = String(sheetTitle).toLowerCase().replace(/\s+/g, '_');
+      const table = tableForSheetTitle(sheetTitle);
       const where = {};
       where[idHeader] = idValue;
       const { data: existing } = await db.from(table).select('*').match(where).limit(1);
@@ -828,6 +1218,7 @@ async function updateSheetRowById(sheets, sheetTitle, idHeader, idValue, patch, 
       if (!allowRow(record)) return null;
       const { data, error } = await db.from(table).update(patch).match(where).select().limit(1);
       if (error) throw error;
+      clearRecordsCache(sheetTitle);
       return (data && data[0]) || null;
     } catch (err) {
       console.error('Supabase updateRow error', err.message || err);
@@ -858,6 +1249,7 @@ async function updateSheetRowById(sheets, sheetTitle, idHeader, idValue, patch, 
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [values] },
   });
+  clearRecordsCache(sheetTitle);
   return updated;
 }
 
@@ -916,6 +1308,81 @@ function carbonSavedVsCng(distanceKm, energyKwh, settings) {
   return Math.max(0, cngEmissions - electricityEmissions);
 }
 
+function normalizeTrendPeriod(value) {
+  return ['week', 'month', 'year'].includes(String(value || '').toLowerCase())
+    ? String(value).toLowerCase()
+    : 'week';
+}
+
+async function getCarbonTrendRecords(sheets, period) {
+  if (useSupabase) {
+    const db = (sheets && sheets.supabase) || supabaseModule.getClient();
+    const start = trendStartDate(period).toISOString();
+    try {
+      const { data, error } = await db
+        .from('vehicle_snapshots')
+        .select('*')
+        .gte('scraped_at', start)
+        .order('scraped_at', { ascending: true });
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Supabase carbon trend fallback:', error.message || error);
+    }
+  }
+  return getFleetRecords(sheets);
+}
+
+function buildCarbonTrend(records, period, settings) {
+  const buckets = trendBuckets(period);
+  const bucketMap = new Map(buckets.map((bucket) => [bucket.key, { ...bucket, value: 0 }]));
+  for (const record of records) {
+    const dateValue = field(record, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'updated_at', 'created_at');
+    const date = new Date(dateValue || 0);
+    if (Number.isNaN(date.getTime())) continue;
+    const key = period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10);
+    const bucket = bucketMap.get(key);
+    if (!bucket) continue;
+    const directCarbon = optionalNumber(record, 'carbon', 'Carbon saved vs CNG', 'carbon_saved_kg');
+    const distance = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+    const energy = optionalNumber(record, 'energy_today_kwh', 'energy consumed', 'energy') ?? 0;
+    const carbon = directCarbon ?? carbonSavedVsCng(distance, energy, settings);
+    if (Number.isFinite(carbon)) bucket.value += carbon;
+  }
+  return [...bucketMap.values()].map((bucket) => ({
+    label: bucket.label,
+    value: Number(bucket.value.toFixed(2)),
+  }));
+}
+
+function trendStartDate(period) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  if (period === 'year') {
+    date.setMonth(date.getMonth() - 11, 1);
+    return date;
+  }
+  date.setDate(date.getDate() - (period === 'month' ? 29 : 6));
+  return date;
+}
+
+function trendBuckets(period) {
+  const start = trendStartDate(period);
+  const formatter = period === 'year'
+    ? new Intl.DateTimeFormat('en', { month: 'short' })
+    : new Intl.DateTimeFormat('en', { day: '2-digit', month: 'short' });
+  const count = period === 'year' ? 12 : period === 'month' ? 30 : 7;
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date(start);
+    if (period === 'year') date.setMonth(start.getMonth() + index);
+    else date.setDate(start.getDate() + index);
+    return {
+      key: period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10),
+      label: formatter.format(date),
+    };
+  });
+}
+
 async function getDashboardSettings(sheets) {
   await ensureSheetWithHeaders(sheets, dashboardSettingsSheetName, ['key', 'value', 'updated_by', 'updated_at']);
   const rows = await getSheetRecords(sheets, dashboardSettingsSheetName);
@@ -958,13 +1425,27 @@ async function findUserByEmail(email) {
   await ensureSheetWithHeaders(sheets, authUsersSheetName, ['name', 'email', 'role', 'client', 'active']);
   const rows = await getSheetRecords(sheets, authUsersSheetName);
   if (!rows.length && defaultAdminEmail) {
-    await appendRecord(sheets, authUsersSheetName, ['name', 'email', 'role', 'client', 'active'], {
-      name: defaultAdminName,
-      email: defaultAdminEmail,
-      role: 'admin',
-      client: '',
-      active: 'TRUE',
-    });
+    if (useSupabase) {
+      const db = supabaseModule.getClient();
+      const { error } = await db.from('users').upsert({
+        name: defaultAdminName,
+        email: defaultAdminEmail,
+        role: 'admin',
+        client: '',
+        active: true,
+        permissions: ['all'],
+      }, { onConflict: 'email' });
+      if (error) throw error;
+      clearRecordsCache(authUsersSheetName);
+    } else {
+      await appendRecord(sheets, authUsersSheetName, ['name', 'email', 'role', 'client', 'active'], {
+        name: defaultAdminName,
+        email: defaultAdminEmail,
+        role: 'admin',
+        client: '',
+        active: 'TRUE',
+      });
+    }
     rows.push({ name: defaultAdminName, email: defaultAdminEmail, role: 'admin', client: '', active: 'TRUE' });
   }
   const match = rows.find((row) => normalizeEmail(row.email || row.Email) === email && normalizeBoolean(row.active ?? row.Active ?? 'TRUE'));
@@ -980,16 +1461,39 @@ async function findUserByEmail(email) {
 }
 
 async function getSheetRecords(sheets, sheetTitle) {
+  const cacheable = apiCacheSeconds > 0 && sheetTitle !== authUsersSheetName;
+  const cacheKey = `${useSupabase ? 'supabase' : 'sheets'}:${sheetTitle}`;
+  if (cacheable) {
+    const cached = sheetRecordsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.rows;
+  }
+  const rows = await loadSheetRecords(sheets, sheetTitle);
+  if (cacheable) {
+    sheetRecordsCache.set(cacheKey, {
+      expiresAt: Date.now() + apiCacheSeconds * 1000,
+      rows,
+    });
+  }
+  return rows;
+}
+
+async function loadSheetRecords(sheets, sheetTitle) {
   if (useSupabase) {
     const db = (sheets && sheets.supabase) || supabaseModule.getClient();
     try {
       if (sheetTitle === authUsersSheetName) {
         const { data } = await db.from('users').select('*');
-        return (data || []).map((u) => ({ name: u.name || '', email: u.email, role: (u.permissions || []).includes('all') ? 'admin' : 'client', client: '', active: 'TRUE' }));
+        return (data || []).map((u) => ({
+          name: u.name || '',
+          email: u.email,
+          role: u.role || ((u.permissions || []).includes('all') ? 'admin' : 'client'),
+          client: u.client || '',
+          active: u.active === false ? 'FALSE' : 'TRUE',
+        }));
       }
       if (sheetTitle === alertRecipientsSheetName) {
         const { data } = await db.from('users').select('*');
-        return (data || []).map((u) => ({ name: u.name || '', email: u.email, role: 'recipient', active: 'TRUE' }));
+        return (data || []).filter((u) => u.active !== false).map((u) => ({ name: u.name || '', email: u.email, role: 'recipient', active: 'TRUE' }));
       }
       if (sheetTitle === clientHubsSheetName) {
         const { data } = await db.from('clients').select('*, hubs(*)');
@@ -1009,7 +1513,17 @@ async function getSheetRecords(sheets, sheetTitle) {
         const { data } = await db.from('clients').select('*, parkings(*)');
         const rows = [];
         (data || []).forEach((c) => {
-          (c.parkings || []).forEach((p) => rows.push({ client: c.name, parking: p.name, parking_gmp_link: p.gmp_link || '', parking_lat: p.lat, parking_lng: p.lng, active: p.enabled ? 'TRUE' : 'FALSE', created_at: p.created_at }));
+          (c.parkings || []).forEach((p) => rows.push({
+            client: c.name,
+            parking: p.name,
+            parking_gmp_link: p.gmp_link || '',
+            parking_lat: p.lat,
+            parking_lng: p.lng,
+            total_spaces: p.total_spaces ?? '',
+            spaces_left: p.spaces_left ?? '',
+            active: p.enabled ? 'TRUE' : 'FALSE',
+            created_at: p.created_at,
+          }));
         });
         return rows;
       }
@@ -1029,8 +1543,10 @@ async function getSheetRecords(sheets, sheetTitle) {
         const { data } = await db.from('settings').select('*');
         return (data || []).map((r) => ({ key: r.key, value: r.value }));
       }
-      const table = String(sheetTitle || '').toLowerCase().replace(/\s+/g, '_');
-      const { data } = await db.from(table).select('*');
+      const table = tableForSheetTitle(sheetTitle);
+      const { data } = table === 'vehicles'
+        ? await db.from(table).select('*').order('last_updated', { ascending: false })
+        : await db.from(table).select('*');
       return data || [];
     } catch (err) {
       console.error('Supabase getSheetRecords error for', sheetTitle, err.message || err);
@@ -1050,32 +1566,32 @@ function buildMovementAlerts(records, settings = defaultSettings()) {
   const targetDate = previousDateKey();
   const latestByVehicle = new Map();
   for (const record of records) {
-    const vehicle = String(record.vehicle_number || '').trim();
+    const vehicle = vehicleIdFromRecord(record);
     if (!vehicle) continue;
-    const recordDate = dateKey(record.vehicle_updated_at || record.scraped_at);
+    const recordDate = dateKey(field(record, 'vehicle_updated_at', 'last_updated', 'updated_at', 'scraped_at'));
     if (recordDate !== targetDate) continue;
-    const currentTime = new Date(record.vehicle_updated_at || record.scraped_at || 0).getTime() || 0;
+    const currentTime = recordTimeMs(record);
     const previous = latestByVehicle.get(vehicle);
-    const previousTime = previous ? new Date(previous.vehicle_updated_at || previous.scraped_at || 0).getTime() || 0 : -1;
+    const previousTime = previous ? recordTimeMs(previous) : -1;
     if (currentTime >= previousTime) latestByVehicle.set(vehicle, record);
   }
   return [...latestByVehicle.values()]
     .map((record) => {
-      const distance = toNumber(record.distance_today_km);
-      const runningMinutes = toNumber(record.today_running_minutes);
+      const distance = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+      const runningMinutes = optionalNumber(record, 'today_running_minutes', 'time today', 'running_minutes') ?? 0;
       const reasons = [];
       if (distance < settings.minDistance) reasons.push(`distance ${distance} km < ${settings.minDistance} km`);
       if (runningMinutes < settings.minRunTime) reasons.push(`running ${runningMinutes} min < ${settings.minRunTime} min`);
       return {
-        vehicle: record.vehicle_number,
-        sourceSystem: record.source_system || 'Unknown',
+        vehicle: vehicleIdFromRecord(record),
+        sourceSystem: field(record, 'source_system', 'source') || 'Unknown',
         date: targetDate,
         distanceTodayKm: distance,
         runningMinutes,
-        batteryPercent: toNumber(record.battery_percent),
-        status: normalizeStatus(record.movement_status_raw || record.vehicle_status_raw || record.charging_status_raw),
-        location: record.location_text || `${record.latitude || ''},${record.longitude || ''}`,
-        lastUpdated: record.vehicle_updated_at || record.scraped_at || '',
+        batteryPercent: optionalNumber(record, 'battery_percent', 'battery%', 'battery', 'soc') ?? 0,
+        status: normalizeStatus(field(record, 'movement_status_raw', 'vehicle_status_raw', 'charging_status_raw', 'current status of vehicle', 'status')),
+        location: field(record, 'location_text', 'location') || coordinateLabel(optionalNumber(record, 'latitude', 'lat'), optionalNumber(record, 'longitude', 'lng', 'long', 'lon')),
+        lastUpdated: field(record, 'vehicle_updated_at', 'last_updated', 'updated_at', 'scraped_at') || '',
         reasons,
       };
     })
@@ -1165,8 +1681,10 @@ function groupClientHubs(rows, parkingRows = []) {
     const gmpLink = String(row.parking_gmp_link || row['Parking GMP Link'] || row.gmpLink || row['Google Maps Link'] || '').trim();
     const lat = toNumber(row.parking_lat || row['Parking Lat']);
     const lng = toNumber(row.parking_lng || row['Parking Lng']);
+    const totalSpaces = toNumber(row.total_spaces || row.totalSpaces || row['Total Spaces']);
+    const spacesLeft = toNumber(row.spaces_left || row.spacesLeft || row['Spaces Left']);
     const record = ensureClient(client, row);
-    if (record && parking) record.parkings.set(parking, { name: parking, gmpLink, lat, lng });
+    if (record && parking) record.parkings.set(parking, { name: parking, gmpLink, lat, lng, totalSpaces, spacesLeft });
   }
 
   return [...grouped.values()].map((record) => ({
@@ -1176,6 +1694,70 @@ function groupClientHubs(rows, parkingRows = []) {
     hubs: [...record.hubs.values()],
     parkings: [...record.parkings.values()],
   }));
+}
+
+async function upsertSupabaseClientLocations({
+  client,
+  gstNumber,
+  clientPoc,
+  hubs,
+  parkings,
+  existingKeys,
+  existingParkingKeys,
+  createdAt,
+}) {
+  const db = supabaseModule.getClient();
+  const { data: clientRows, error: clientError } = await db
+    .from('clients')
+    .upsert({ name: client, gst_number: gstNumber, poc: clientPoc }, { onConflict: 'name' })
+    .select('id')
+    .limit(1);
+  if (clientError) throw clientError;
+  const clientId = clientRows?.[0]?.id;
+  if (!clientId) throw new Error('Unable to create or load Supabase client record');
+
+  const hubInserts = hubs
+    .filter((hub) => !existingKeys.has(`${client.toLowerCase()}::${hub.name.toLowerCase()}`))
+    .map((hub) => {
+      const coords = extractMapCoords(hub.gmpLink) || {};
+      return {
+        client_id: clientId,
+        name: hub.name,
+        gmp_link: hub.gmpLink,
+        lat: coords.lat || null,
+        lng: coords.lng || null,
+        enabled: true,
+        created_at: createdAt,
+      };
+    });
+  const parkingInserts = parkings
+    .filter((parking) => !existingParkingKeys.has(`${client.toLowerCase()}::${parking.name.toLowerCase()}`))
+    .map((parking) => {
+      const coords = extractMapCoords(parking.gmpLink) || {};
+      const spaces = normalizeParkingSpaces(parking.spaces) ?? 0;
+      return {
+        client_id: clientId,
+        name: parking.name,
+        gmp_link: parking.gmpLink,
+        lat: coords.lat || null,
+        lng: coords.lng || null,
+        total_spaces: spaces,
+        spaces_left: spaces,
+        enabled: true,
+        created_at: createdAt,
+      };
+    });
+
+  if (hubInserts.length) {
+    const { error } = await db.from('hubs').insert(hubInserts);
+    if (error) throw error;
+  }
+  if (parkingInserts.length) {
+    const { error } = await db.from('parkings').insert(parkingInserts);
+    if (error) throw error;
+  }
+  clearRecordsCache(clientHubsSheetName);
+  clearRecordsCache(clientParkingsSheetName);
 }
 
 async function ensureSheetWithHeaders(sheets, sheetTitle, headers) {
@@ -1215,12 +1797,24 @@ function parseCookies(cookieHeader) {
   }).filter(([key]) => key));
 }
 
+function sessionCookie(token, maxAgeSeconds) {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return `kyoto_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSeconds}${secure}`;
+}
+
 function hashOtp(otp) {
   return crypto.createHash('sha256').update(String(otp)).digest('hex');
 }
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function simplifyPlaceLabel(address) {
+  const parts = String(address || '').split(',').map((part) => part.trim()).filter(Boolean);
+  if (parts.length <= 2) return parts.join(', ');
+  // Keep the most local chunks, drop country-level noise.
+  return parts.slice(0, 3).join(', ');
 }
 
 function normalizeBoolean(value) {

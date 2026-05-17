@@ -32,16 +32,29 @@ psql "postgresql://postgres:$(echo $SUPABASE_SERVICE_ROLE_KEY)@db.your-supabase-
 SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 USE_SUPABASE=true
+API_CACHE_SECONDS=30
 ```
 
    - `server/supabaseClient.js` expects `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
 
-6) Edge Functions (optional)
+6) Connect scraper
+   - In `New folder (6)/.env`, set:
+
+```
+SCRAPER_STORAGE=supabase
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+```
+
+   - The scraper upserts current vehicle state into `vehicles` and appends history to `vehicle_snapshots`.
+
+7) Edge Functions (optional)
    - You can port specific endpoints to Supabase Edge Functions (Deno) for lower latency.
    - Keep sensitive service role operations in server-side Node code.
 
-7) Deployment
-   - Deploy frontend to Vercel / Netlify / Supabase Hosting (static) using `vite build` outputs in `dist`.
-   - Deploy Node server to a platform (Railway, Render, Heroku) and set the env vars above.
+8) Deployment
+   - Recommended shape: deploy this folder's `Dockerfile` as the web/API service.
+   - Deploy `New folder (6)/Dockerfile` as a separate always-on worker for the scraper.
+   - Set the same `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` on both services.
 
 If you want, I can generate SQL to import CSVs from your Sheets export and prepare a minimal seed file.

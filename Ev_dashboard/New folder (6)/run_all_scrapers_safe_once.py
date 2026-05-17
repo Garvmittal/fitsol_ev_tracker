@@ -9,6 +9,7 @@ from src.euler_scraper.scraper import EulerScraper
 from src.euler_scraper.sheets import GoogleSheetsAppender
 from src.intellicar_scraper.config import load_settings as load_intellicar_settings
 from src.intellicar_scraper.scraper import AgenticIntellicarScraper
+from src.supabase_appender import build_supabase_appender_from_env
 from src.vehicle_snapshot_schema import output_headers
 
 
@@ -42,6 +43,12 @@ def main() -> None:
 
     if len(records) < 40:
         raise RuntimeError(f"Refusing to write incomplete scrape. Only collected {len(records)} rows.")
+
+    supabase_appender = build_supabase_appender_from_env()
+    if supabase_appender:
+        supabase_appender.append(records)
+        logging.info("Wrote %s rows to Supabase", len(records))
+        return
 
     appender = GoogleSheetsAppender(
         euler_settings.google_sheet_id,
