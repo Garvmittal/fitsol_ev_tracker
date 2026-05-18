@@ -35,6 +35,7 @@ import {
   Zap,
 } from 'lucide-react';
 import './styles.css';
+import { supabaseApiJson, supabaseDirectEnabled } from './supabaseApi.js';
 
 const vehiclesSeed = [
   {
@@ -317,29 +318,20 @@ function App() {
   }, [auth.loading, auth.user]);
 
   useEffect(() => {
-    fetch('/api/auth/me')
-      .then(async (response) => {
-        if (!response.ok) throw new Error('Not signed in');
-        return response.json();
-      })
+    apiJson('/api/auth/me')
       .then((payload) => setAuth({ user: payload.user, authRequired: payload.authRequired, loading: false }))
       .catch(() => setAuth({ user: null, authRequired: true, loading: false }));
   }, []);
 
   useEffect(() => {
-    fetch('/api/config')
-      .then((response) => response.json())
+    apiJson('/api/config')
       .then((payload) => setMapConfig(payload.googleMaps || { enabled: false, apiKey: '', mapId: '', missing: { apiKey: true, mapId: true } }))
       .catch(() => setMapConfig({ enabled: false, apiKey: '', mapId: '', missing: { apiKey: true, mapId: true } }));
   }, []);
 
   useEffect(() => {
     if (auth.loading || !auth.user || !canAccess(auth.user, 'fleet')) return;
-    fetch('/api/client-hubs')
-      .then(async (response) => {
-        if (!response.ok) throw new Error('Client hub sheet unavailable');
-        return response.json();
-      })
+    apiJson('/api/client-hubs')
       .then((payload) => {
         if (payload.clients?.length) setClientHubs(payload.clients);
       })
@@ -878,7 +870,7 @@ function App() {
   }
 
   async function logout() {
-    await fetch('/api/auth/logout', { method: 'POST' });
+    await apiJson('/api/auth/logout', { method: 'POST' });
     setAuth((current) => ({ ...current, user: current.authRequired ? null : { name: 'Guest Admin', role: 'admin', permissions: ['all'] } }));
   }
 
@@ -2323,13 +2315,10 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
     e && e.preventDefault();
     if (!viewingClient || !newHubName) return;
     try {
-      const response = await fetch('/api/client-hubs', {
+      const payload = await apiJson('/api/client-hubs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ client: viewingClient.client, gstNumber: viewingClient.gstNumber || '', clientPoc: viewingClient.clientPoc || '', hubs: `${newHubName} | ${newHubLink}`, parkings: '' }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || payload.message || 'Unable to add hub');
       setNewHubName(''); setNewHubLink('');
       if (refreshClientHubs) await refreshClientHubs();
       setViewingClient(payload.clients?.find((c) => c.client === viewingClient.client) || viewingClient);
@@ -3091,9 +3080,7 @@ function AlertsPanel() {
   async function loadPreview() {
     setState((current) => ({ ...current, loading: true, error: '' }));
     try {
-      const response = await fetch('/api/alerts/preview');
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.message || payload.error || 'Unable to load alerts');
+      const payload = await apiJson('/api/alerts/preview');
       if (payload.setupNeeded) throw new Error(payload.message || payload.error || 'Alert setup needed');
       setState({ loading: false, alerts: payload.alerts || [], recipients: payload.recipients || [], thresholds: payload.thresholds, previousDate: payload.previousDate, error: '' });
     } catch (error) {
@@ -3104,10 +3091,8 @@ function AlertsPanel() {
   async function sendAlerts() {
     setSending(true);
     try {
-      const response = await fetch('/api/alerts/send', { method: 'POST' });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || payload.message || 'Unable to send alerts');
-      setState((current) => ({ ...current, sentMessage: `Sent to ${payload.sent} recipient(s) for ${payload.vehicles || 0} vehicle(s). Delivery: ${payload.delivery?.mode || 'none'}` }));
+      const payload = await apiJson('/api/alerts/send', { method: 'POST' });
+      setState((current) => ({ ...current, sentMessage: payload.message || `Sent to ${payload.sent} recipient(s) for ${payload.vehicles || 0} vehicle(s). Delivery: ${payload.delivery?.mode || 'none'}` }));
     } catch (error) {
       setState((current) => ({ ...current, sentMessage: error.message }));
     } finally {
@@ -3205,8 +3190,18 @@ function MetricMini({ icon: Icon, label, value }) {
   );
 }
 
+function apiFetch(url, options = {}) {
+  return fetch(url, {
+    credentials: 'include',
+    ...options,
+  });
+}
+
 async function apiJson(url, options = {}) {
-  const response = await fetch(url, {
+  if (supabaseDirectEnabled && String(url || '').startsWith('/api/')) {
+    return supabaseApiJson(url, options);
+  }
+  const response = await apiFetch(url, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
@@ -3239,9 +3234,12 @@ async function loadProductionVehicles() {
   const csvUrl = import.meta.env.VITE_GOOGLE_SHEET_CSV_URL;
 
   if (apiUrl) {
-    const response = await fetch(apiUrl, { headers: { Accept: 'application/json' } });
-    if (!response.ok) throw new Error(`API ${response.status}`);
-    const payload = await response.json();
+    const payload = String(apiUrl).startsWith('/api/')
+      ? await apiJson(apiUrl)
+      : await fetch(apiUrl, { headers: { Accept: 'application/json' } }).then((response) => {
+          if (!response.ok) throw new Error(`API ${response.status}`);
+          return response.json();
+        });
     const rows = Array.isArray(payload) ? payload : payload.vehicles;
     if ((rows || []).every((row) => row.id && row.lat !== undefined && row.lng !== undefined)) return rows;
     return normalizeVehicleRows(rows || []);
@@ -3434,12 +3432,8 @@ function useNearPlaceLabel(lat, lng) {
       return;
     }
     let cancelled = false;
-    fetch(`/api/reverse-geocode?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`)
-      .then(async (response) => {
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(payload.error || payload.message || 'Reverse geocode failed');
-        return payload.place || '';
-      })
+    apiJson(`/api/reverse-geocode?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`)
+      .then((payload) => payload.place || '')
       .then((place) => {
         if (cancelled) return;
         const formatted = place ? `Near ${place}` : '';
