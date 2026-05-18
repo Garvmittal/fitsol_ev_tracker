@@ -264,27 +264,32 @@ async function createDriver(body, user) {
   requirePermission(user, 'drivers');
   const row = {
     driver_id: cryptoRandomId(),
-    name: body.name || '',
-    phone: body.phone || '',
-    license_number: body.licenseNumber || '',
+    name: String(body.name || '').trim(),
+    phone: String(body.phone || '').trim(),
+    license_number: String(body.licenseNumber || '').trim(),
     dob: body.dob || '',
     email: normalizeEmail(body.email),
     created_by: user.email,
     created_at: new Date().toISOString(),
   };
+  const duplicateMessage = await findDuplicateDriverMessage(row);
+  if (duplicateMessage) throw new Error(duplicateMessage);
   const { error } = await supabase.from('drivers').insert(row);
-  if (error) throw error;
+  if (error) throw new Error(driverPersistenceErrorMessage(error));
   return getDrivers(user);
 }
 
 async function updateDriver(path, body, user) {
   requirePermission(user, 'drivers');
   const driverId = decodeURIComponent(path.split('/').pop() || '');
+  const phone = String(body.phone || '').trim();
+  const duplicateMessage = await findDuplicateDriverMessage({ phone }, driverId);
+  if (duplicateMessage) throw new Error(duplicateMessage);
   const { error } = await supabase
     .from('drivers')
-    .update({ phone: body.phone || '', updated_at: new Date().toISOString() })
+    .update({ phone, updated_at: new Date().toISOString() })
     .eq('driver_id', driverId);
-  if (error) throw error;
+  if (error) throw new Error(driverPersistenceErrorMessage(error));
   return getDrivers(user);
 }
 
@@ -950,6 +955,45 @@ function coordinateLabel(lat, lng) {
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizePhone(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function normalizeLicense(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function findDuplicateDriverMessage(candidate, excludeDriverId = '') {
+  const phone = normalizePhone(candidate.phone);
+  const email = normalizeEmail(candidate.email);
+  const license = normalizeLicense(candidate.license_number || candidate.licenseNumber);
+  if (!phone && !email && !license) return '';
+  const rows = await listRows('drivers', 'created_at', false);
+  const excludeId = String(excludeDriverId || '').trim();
+  const duplicate = (rows || []).find((row) => {
+    const driverId = String(row.driver_id || row.driverId || '').trim();
+    if (excludeId && driverId === excludeId) return false;
+    return (
+      (phone && normalizePhone(row.phone) === phone)
+      || (email && normalizeEmail(row.email) === email)
+      || (license && normalizeLicense(row.license_number || row.licenseNumber) === license)
+    );
+  });
+  if (!duplicate) return '';
+  if (phone && normalizePhone(duplicate.phone) === phone) return 'A driver with this contact number already exists.';
+  if (email && normalizeEmail(duplicate.email) === email) return 'A driver with this email already exists.';
+  if (license && normalizeLicense(duplicate.license_number || duplicate.licenseNumber) === license) return 'A driver with this license number already exists.';
+  return 'This driver already exists.';
+}
+
+function driverPersistenceErrorMessage(error) {
+  const text = `${error?.code || ''} ${error?.message || ''}`.toLowerCase();
+  if (text.includes('phone') || text.includes('idx_drivers_phone')) return 'A driver with this contact number already exists.';
+  if (text.includes('email') || text.includes('idx_drivers_email')) return 'A driver with this email already exists.';
+  if (text.includes('license') || text.includes('idx_drivers_license')) return 'A driver with this license number already exists.';
+  return error?.message || 'Unable to save driver.';
 }
 
 function normalizeText(value) {

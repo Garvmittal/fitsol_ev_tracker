@@ -514,6 +514,13 @@ function App() {
       return false;
     }
 
+    const duplicateMessage = findDuplicateDriverMessage(drivers, { phone, email, licenseNumber });
+    if (duplicateMessage) {
+      setToast(duplicateMessage);
+      window.setTimeout(() => setToast(''), 3000);
+      return false;
+    }
+
     try {
       const payload = await apiJson('/api/drivers', {
         method: 'POST',
@@ -532,6 +539,13 @@ function App() {
   }
 
   async function updateDriverPhone(driverId, phone) {
+    const duplicatePhone = findDuplicateDriverMessage(drivers, { phone }, driverId);
+    if (duplicatePhone) {
+      setToast(duplicatePhone);
+      window.setTimeout(() => setToast(''), 3000);
+      return false;
+    }
+
     try {
       const payload = await apiJson(`/api/drivers/${encodeURIComponent(driverId)}`, {
         method: 'PATCH',
@@ -540,9 +554,11 @@ function App() {
       if (payload.drivers) setDrivers(payload.drivers);
       setToast('Driver contact updated.');
       window.setTimeout(() => setToast(''), 2400);
+      return true;
     } catch (error) {
       setToast(error.message || 'Unable to update driver.');
       window.setTimeout(() => setToast(''), 2600);
+      return false;
     }
   }
 
@@ -2501,9 +2517,11 @@ function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDri
 
   async function saveEdit() {
     if (!editing) return;
-    await updateDriverPhone(editing.driverId, editPhone);
-    setEditing(null);
-    setEditPhone('');
+    const saved = await updateDriverPhone(editing.driverId, editPhone);
+    if (saved) {
+      setEditing(null);
+      setEditPhone('');
+    }
   }
 
   return (
@@ -2574,7 +2592,7 @@ function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDri
         <div className="empty-state">No drivers onboarded yet.</div>
       )}
 
-      {driverModalOpen && <DriverOnboardingModal addDriver={addDriver} closeModal={() => setDriverModalOpen(false)} />}
+      {driverModalOpen && <DriverOnboardingModal addDriver={async (event) => { const ok = await addDriver(event); if (ok) setDriverModalOpen(false); return ok; }} closeModal={() => setDriverModalOpen(false)} />}
 
       {editing && (
         <div className="modal-backdrop" role="presentation">
@@ -3418,6 +3436,35 @@ function deploymentStatusLabel(vehicle) {
 
 function normalizeClientName(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizeDriverPhone(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function normalizeLicenseNumber(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function findDuplicateDriverMessage(drivers = [], candidate = {}, excludeDriverId = '') {
+  const candidatePhone = normalizeDriverPhone(candidate.phone);
+  const candidateEmail = normalizeClientName(candidate.email);
+  const candidateLicense = normalizeLicenseNumber(candidate.licenseNumber);
+  const excludeId = String(excludeDriverId || '').trim();
+  const duplicate = (drivers || []).find((driver) => {
+    const driverId = String(driver.driverId || driver.id || '').trim();
+    if (excludeId && driverId === excludeId) return false;
+    return (
+      (candidatePhone && normalizeDriverPhone(driver.phone) === candidatePhone)
+      || (candidateEmail && normalizeClientName(driver.email) === candidateEmail)
+      || (candidateLicense && normalizeLicenseNumber(driver.licenseNumber) === candidateLicense)
+    );
+  });
+  if (!duplicate) return '';
+  if (candidatePhone && normalizeDriverPhone(duplicate.phone) === candidatePhone) return 'A driver with this contact number already exists.';
+  if (candidateEmail && normalizeClientName(duplicate.email) === candidateEmail) return 'A driver with this email already exists.';
+  if (candidateLicense && normalizeLicenseNumber(duplicate.licenseNumber) === candidateLicense) return 'A driver with this license number already exists.';
+  return 'This driver already exists.';
 }
 
 function normalizeLocationRecords(records = []) {
