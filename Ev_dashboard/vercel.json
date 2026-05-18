@@ -8,7 +8,6 @@
     }
   ],
   "routes": [
-    { "src": "/api/(.*)", "status": 404, "dest": "/api/$1" },
     { "src": "/.*", "dest": "/index.html" }
   ]
 }
