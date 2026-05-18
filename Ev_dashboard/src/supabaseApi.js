@@ -2,6 +2,9 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const staticLoginOtp = String(import.meta.env.VITE_STATIC_LOGIN_OTP || '').trim();
+const staticLoginPassword = String(import.meta.env.VITE_STATIC_LOGIN_PASSWORD || staticLoginOtp).trim();
+const staticLoginEnabled = Boolean(staticLoginOtp);
 
 export const supabaseDirectEnabled = Boolean(supabaseUrl && supabaseAnonKey);
 
@@ -71,6 +74,8 @@ function parseBody(body) {
 async function requestOtp(body) {
   const email = normalizeEmail(body.email);
   if (!email) throw new Error('Email is required');
+  if (staticLoginEnabled) return { ok: true, delivery: 'static-otp' };
+
   const { error } = await supabase.auth.signInWithOtp({
     email,
     options: {
@@ -86,6 +91,26 @@ async function verifyOtp(body) {
   const email = normalizeEmail(body.email);
   const token = String(body.otp || '').trim();
   if (!email || !token) throw new Error('Email and OTP are required');
+
+  if (staticLoginEnabled) {
+    if (token !== staticLoginOtp) throw new Error('Invalid OTP');
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password: staticLoginPassword,
+    });
+    if (error) {
+      throw new Error(
+        'Static OTP matched, but Supabase password login failed. Set this Auth user password to VITE_STATIC_LOGIN_PASSWORD or the static OTP.'
+      );
+    }
+    const user = await getPortalUserByEmail(data.user?.email || email);
+    if (!user) {
+      await supabase.auth.signOut();
+      throw new Error('This email is not allowed for dashboard access');
+    }
+    return { user };
+  }
+
   const { data, error } = await supabase.auth.verifyOtp({ email, token, type: 'email' });
   if (error) throw new Error(error.message || 'Invalid or expired OTP');
   const user = await getPortalUserByEmail(data.user?.email || email);

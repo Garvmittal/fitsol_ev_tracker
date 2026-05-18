@@ -847,7 +847,13 @@ function App() {
         body: JSON.stringify({ email: loginEmail }),
       });
       setOtpSent(true);
-      setLoginMessage(payload.devOtp ? `OTP sent. Dev OTP: ${payload.devOtp}` : 'OTP sent to your email.');
+      setLoginMessage(
+        payload.delivery === 'static-otp'
+          ? 'Enter the configured dashboard OTP.'
+          : payload.devOtp
+            ? `OTP sent. Dev OTP: ${payload.devOtp}`
+            : 'OTP sent to your email.'
+      );
     } catch (error) {
       setLoginMessage(error.message || 'Unable to send OTP');
     }
