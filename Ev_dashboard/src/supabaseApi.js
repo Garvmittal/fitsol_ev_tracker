@@ -602,18 +602,50 @@ function normalizeClient(row) {
 }
 
 function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = normalizeSettings()) {
-  const raw = latestSnapshot?.raw_payload || row.metadata || {};
+  const raw = objectValue(latestSnapshot?.raw_payload) || objectValue(row.metadata) || {};
   const source = latestSnapshot || {};
-  const lat = toNumberOrUndefined(firstValue(source.latitude, raw.lat, row.lat, row.latitude));
-  const lng = toNumberOrUndefined(firstValue(source.longitude, raw.long, raw.lng, row.lng, row.longitude));
-  const todayDistance = toNumber(firstValue(source.distance_today_km, raw['Dist._today'], row.today_distance, row.distance_today_km));
-  const runningMinutes = numberOrNull(firstValue(source.today_running_minutes, raw['time today'], row.today_running_minutes));
-  const runningTime = minutesLabel(runningMinutes) || row.running_time || '0h 0m';
-  const avgSpeed = averageSpeedLabel(todayDistance, runningMinutes, firstValue(source.today_avg_speed_kmph, raw['average speed(calculated from distance and time)'], row.avg_speed));
-  const lastStop = firstText(source.last_stop_location_text, raw['last stop'], row.last_stop, row.last_stop_location_text, coordinateLabel(lat, lng), 'No stop recorded today');
+  const lat = toNumberOrUndefined(firstValue(source.latitude, source.lat, raw.lat, raw.latitude, row.lat, row.latitude));
+  const lng = toNumberOrUndefined(firstValue(source.longitude, source.lng, source.long, raw.long, raw.lng, raw.longitude, row.lng, row.longitude));
+  const todayDistance = numberFromTelemetry(firstValue(
+    source.distance_today_km,
+    source.today_distance,
+    raw['Dist._today'],
+    raw.distance_today_km,
+    raw.today_distance,
+    raw.distance_today,
+    row.today_distance,
+    row.distance_today_km,
+  )) ?? 0;
+  const runningMinutes = minutesFromTelemetry(firstValue(
+    source.today_running_minutes,
+    raw['time today'],
+    raw.today_running_minutes,
+    raw.running_minutes,
+    row.today_running_minutes,
+    row.running_minutes,
+    row.running_time,
+  ));
+  const runningTime = minutesLabel(runningMinutes) || firstText(row.running_time, raw.running_time, '0h 0m');
+  const avgSpeed = averageSpeedLabel(todayDistance, runningMinutes, firstValue(
+    source.today_avg_speed_kmph,
+    raw['average speed(calculated from distance and time)'],
+    raw.today_avg_speed_kmph,
+    raw.avg_speed,
+    row.avg_speed,
+  ));
+  const energyValue = firstValue(
+    source.energy_today_kwh,
+    raw['energy consumed'],
+    raw.energy_today_kwh,
+    raw.energy,
+    row.energy_today_kwh,
+    row.energy,
+  );
+  const energyToday = numberFromTelemetry(energyValue);
+  const energy = formatWithUnit(energyValue, 'kWh', energyToday === 0 ? '0 kWh' : 'Unavailable');
+  const lastStop = firstText(source.last_stop_location_text, raw['last stop'], raw.last_stop_location_text, raw.last_stop, row.last_stop, row.last_stop_location_text, coordinateLabel(lat, lng), 'No stop recorded today');
   const lastUpdated = firstText(source.scraped_at, row.last_updated, row.updated_at, row.created_at, '');
-  const carbonSaved = carbonSavedVsCng(todayDistance, settings);
-  const carbonRate = carbonRateVsCng(settings);
+  const carbonSaved = carbonSavedVsCng(todayDistance, energyToday, settings);
   const model = firstText(source.vehicle_model, raw['vehicle model/model'], row.model, row.source_system, 'Model pending');
   const sourceSystem = firstText(source.source, raw.source, row.source_system, 'Source pending');
 
@@ -632,7 +664,7 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     avgSpeed,
     temp: firstText(row.temp, raw.battery_temperature_c, 'Not recorded'),
     odometer: firstText(source.odometer_km, raw.odometer, row.odometer, 'Not recorded'),
-    energy: '',
+    energy,
     eta: row.eta || 'Unavailable',
     etaDate: row.eta_date || '',
     lastUpdated,
@@ -643,7 +675,9 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     location: firstText(row.location, row.location_text, lastStop, coordinateLabel(lat, lng), 'Location pending'),
     lastStop,
     carbon: `${carbonSaved.toFixed(1)} kgCO2e`,
-    confidence: `Estimated from distance x ${carbonRate.toFixed(3)} kgCO2e/km vs CNG`,
+    confidence: energyToday === null
+      ? `Estimated from distance using ${settings.evEnergy} kWh/km fallback vs CNG`
+      : 'Estimated from distance and energy vs CNG',
     trips: [{
       title: 'Latest stop',
       location: lastStop,
@@ -779,8 +813,8 @@ function buildMovementAlerts(records, settings) {
   const targetDate = previousDateKey();
   const latestByVehicle = latestByKey(records.filter((row) => dateKey(row.scraped_at || row.last_updated || row.updated_at) === targetDate), 'vehicle_id', 'scraped_at');
   return [...latestByVehicle.values()].map((record) => {
-    const distance = Number(record.distance_today_km ?? record.today_distance ?? 0);
-    const runningMinutes = Number(record.today_running_minutes ?? 0);
+    const distance = numberFromTelemetry(record.distance_today_km ?? record.today_distance) ?? 0;
+    const runningMinutes = minutesFromTelemetry(record.today_running_minutes) ?? 0;
     const reasons = [];
     if (distance < settings.minDistance) reasons.push(`distance ${distance} km < ${settings.minDistance} km`);
     if (runningMinutes < settings.minRunTime) reasons.push(`running ${runningMinutes} min < ${settings.minRunTime} min`);
@@ -820,8 +854,9 @@ function buildCarbonTrend(records, period, settings) {
     const key = mapKey.split(':')[0];
     const bucket = bucketMap.get(key);
     if (!bucket) return;
-    const distance = Number(record.distance_today_km ?? record.today_distance ?? 0);
-    const carbon = carbonSavedVsCng(distance, settings);
+    const distance = numberFromTelemetry(record.distance_today_km ?? record.today_distance) ?? 0;
+    const energy = numberFromTelemetry(record.energy_today_kwh ?? record.energy);
+    const carbon = carbonSavedVsCng(distance, energy, settings);
     if (Number.isFinite(carbon)) bucket.value += carbon;
   });
   return [...bucketMap.values()].map((bucket) => ({ label: bucket.label, value: Number(bucket.value.toFixed(2)) }));
@@ -901,12 +936,30 @@ function latestSnapshotByVehicle(rows) {
 }
 
 function firstValue(...values) {
-  return values.find((value) => value !== undefined && value !== null && String(value).trim() !== '' && String(value).trim() !== 'Unavailable');
+  return values.find(isMeaningful);
 }
 
 function firstText(...values) {
   const value = firstValue(...values);
   return value === undefined ? '' : String(value).trim();
+}
+
+function isMeaningful(value) {
+  if (value === undefined || value === null) return false;
+  const text = String(value).trim();
+  return Boolean(text) && !['N/A', 'Unavailable', 'undefined', 'null', 'NaN'].includes(text);
+}
+
+function objectValue(value) {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function locationStateFor(vehicle, deployment) {
@@ -974,9 +1027,12 @@ function carbonRateVsCng(settings) {
   return Math.max(0, cngEmissionsPerKm - evEmissionsPerKm);
 }
 
-function carbonSavedVsCng(distanceKm, settings) {
+function carbonSavedVsCng(distanceKm, energyKwh, settings) {
   if (!distanceKm) return 0;
-  return Math.max(0, distanceKm * carbonRateVsCng(settings));
+  const evEnergy = Number.isFinite(energyKwh) ? energyKwh : distanceKm * settings.evEnergy;
+  const cngEmissions = distanceKm * settings.cngConsumption * settings.cngFactor;
+  const electricityEmissions = evEnergy * settings.electricityFactor;
+  return Math.max(0, cngEmissions - electricityEmissions);
 }
 
 function normalizeStatus(value) {
@@ -1008,7 +1064,30 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
+function numberFromTelemetry(value) {
+  if (!isMeaningful(value)) return null;
+  const number = Number(String(value).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/)?.[0] ?? value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function minutesFromTelemetry(value) {
+  const numeric = numberFromTelemetry(value);
+  if (numeric !== null && !/[a-z]/i.test(String(value))) return numeric;
+  const text = String(value || '').toLowerCase();
+  let minutes = 0;
+  const hrMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
+  if (hrMatch) minutes += Number(hrMatch[1]) * 60;
+  const hourWord = text.match(/(\d+(?:\.\d+)?)\s*hour/);
+  if (hourWord) minutes += Number(hourWord[1]) * 60;
+  const minMatch = text.match(/(\d+(?:\.\d+)?)\s*m(?![a-z])/);
+  if (minMatch) minutes += Number(minMatch[1]);
+  const minWord = text.match(/(\d+(?:\.\d+)?)\s*min/);
+  if (minWord) minutes += Number(minWord[1]);
+  return Number.isFinite(minutes) && minutes > 0 ? minutes : numeric;
+}
+
 function minutesLabel(value) {
+  if (value === undefined || value === null || value === '') return '';
   const minutes = Number(value);
   if (!Number.isFinite(minutes)) return '';
   const hours = Math.floor(minutes / 60);
@@ -1027,6 +1106,14 @@ function averageSpeedLabel(distanceKm, runningMinutes, fallback = '') {
   const fallbackText = String(fallback || '').trim();
   if (fallbackText && !/unavailable/i.test(fallbackText)) return fallbackText;
   return distance ? 'Needs review' : '0 km/h';
+}
+
+function formatWithUnit(value, unit, fallback = 'Unavailable') {
+  if (!isMeaningful(value)) return fallback;
+  const text = String(value).trim();
+  if (/[a-z%]/i.test(text)) return text;
+  const number = numberFromTelemetry(value);
+  return number === null ? text : `${number} ${unit}`;
 }
 
 function todayStartIsoForIndia() {

@@ -1838,6 +1838,7 @@ function VehicleCard({ vehicle, driverContact, selected, onClick }) {
       <div className="insight-grid">
         <Info label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} strong />
         <Info label="Average speed" value={safeValue(avgSpeedLabel)} />
+        <Info label="Energy today" value={safeValue(vehicle.energy)} />
         <Info label="Last stop" value={safeValue(vehicle.lastStop, 'No stop recorded today')} />
         <Info label="Source" value={safeValue(vehicle.sourceSystem, 'Telemetry source pending')} />
       </div>
@@ -2284,6 +2285,7 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
         <MetricMini icon={Route} label="Distance today" value={`${vehicle.todayDistance} km`} />
         <MetricMini icon={Gauge} label="Running time" value={safeValue(vehicle.runningTime)} />
         <MetricMini icon={Car} label="Odometer" value={formatOdometer(vehicle.odometer)} />
+        <MetricMini icon={Zap} label="Energy today" value={safeValue(vehicle.energy)} />
         <MetricMini icon={Zap} label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} />
       </div>
       <div className="detail-tabs">
@@ -2308,6 +2310,7 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
           <p>Place status: {vehicle.locationState || 'Not assigned to a hub/parking geofence'}</p>
           {vehicle.hubGmpLink && <p><ActionLink href={vehicle.hubGmpLink} icon={MapPin} label="Open hub map" /></p>}
           {vehicle.parkingGmpLink && <p><ActionLink href={vehicle.parkingGmpLink} icon={ParkingCircle} label="Open parking map" /></p>}
+          <p>Energy today: {safeValue(vehicle.energy)}</p>
           <p>Carbon basis: {safeValue(vehicle.confidence, 'Estimated vs CNG')}</p>
         </div>
         <div>
@@ -3296,7 +3299,13 @@ async function loadProductionVehicles() {
           return response.json();
         });
     const rows = Array.isArray(payload) ? payload : payload.vehicles;
-    if ((rows || []).every((row) => row.id && row.lat !== undefined && row.lng !== undefined)) return rows;
+    const alreadyNormalized = (rows || []).every((row) => (
+      row.id
+      && row.lat !== undefined
+      && row.lng !== undefined
+      && (row.todayDistance !== undefined || row.runningTime !== undefined || row.lastStop !== undefined)
+    ));
+    if (alreadyNormalized) return rows;
     return normalizeVehicleRows(rows || []);
   }
 
@@ -3332,12 +3341,12 @@ function normalizeVehicleRows(rows) {
       status: normalizeStatus(get('status', 'Live status', 'Current status')),
       battery: Number(get('battery', 'battery_percent', 'Current battery charge', 'soc')) || 0,
       distance: Number(get('distance_left', 'Distance left')) || 0,
-      todayDistance: Number(get('distance_today', 'Distance covered today', 'Distance covered')) || 0,
-      runningTime: get('running_time', 'Running time today') || 'Unavailable',
-      avgSpeed: get('average_speed', 'Average speed today') || 'Unavailable',
+      todayDistance: Number(get('today_distance', 'distance_today_km', 'Dist._today', 'distance_today', 'Distance covered today', 'Distance covered')) || 0,
+      runningTime: get('running_time', 'today_running_minutes', 'time today', 'Running time today') || 'Unavailable',
+      avgSpeed: get('avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today') || 'Unavailable',
       temp: get('temperature', 'Temperature') || 'Unavailable',
       odometer: get('odometer', 'Odometer') || 'Unavailable',
-      energy: get('energy', 'Energy consumed today') || 'Unavailable',
+      energy: get('energy', 'energy_today_kwh', 'energy consumed', 'Energy consumed today') || 'Unavailable',
       eta: get('eta', 'Estimated Time of Arrival') || 'Unavailable',
       etaDate: get('eta_date', 'ETA date') || '06-05-2026',
       lastUpdated: get('last_updated', 'Last updated', 'Vehicle updated timestamp') || 'Unavailable',
@@ -3346,7 +3355,7 @@ function normalizeVehicleRows(rows) {
       driverMeta: get('driver_meta') || 'Loaded from production source',
       route: get('route', 'Route') || 'Route unavailable',
       location: get('location', 'Current location text') || 'Location unavailable',
-      lastStop: get('last_stop', 'Last stop text address') || 'Last stop unavailable',
+      lastStop: get('last_stop', 'last_stop_location_text', 'last stop', 'Last stop text address') || 'Last stop unavailable',
       carbon: get('carbon', 'Carbon saved vs CNG') || 'Unavailable',
       confidence: get('carbon_confidence', 'Carbon confidence') || 'Unavailable',
       hubGmpLink: get('hub_gmp_link', 'Hub GMP Link', 'Hub Google Maps link') || '',
