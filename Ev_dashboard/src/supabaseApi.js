@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
-const staticLoginOtp = String(import.meta.env.VITE_STATIC_LOGIN_OTP || '').trim();
+const staticLoginOtp = String(import.meta.env.VITE_STATIC_LOGIN_OTP || '123456').trim();
 const staticLoginPassword = String(import.meta.env.VITE_STATIC_LOGIN_PASSWORD || staticLoginOtp).trim();
 const staticLoginEnabled = Boolean(staticLoginOtp);
 
