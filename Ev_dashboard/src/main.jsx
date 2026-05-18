@@ -250,7 +250,7 @@ function App() {
   const [range, setRange] = useState({ from: '2026-04-29', to: '2026-05-06' });
   const [rangeError, setRangeError] = useState('');
   const [toast, setToast] = useState('');
-  const [auth, setAuth] = useState({ user: null, authRequired: false, loading: true });
+  const [auth, setAuth] = useState({ user: null, authRequired: true, loading: true });
   const [mapConfig, setMapConfig] = useState({ enabled: false, apiKey: '', mapId: '', missing: { apiKey: true, mapId: true } });
   const [loginEmail, setLoginEmail] = useState('');
   const [otp, setOtp] = useState('');
@@ -871,7 +871,11 @@ function App() {
 
   async function logout() {
     await apiJson('/api/auth/logout', { method: 'POST' });
-    setAuth((current) => ({ ...current, user: current.authRequired ? null : { name: 'Guest Admin', role: 'admin', permissions: ['all'] } }));
+    setAuth({ user: null, authRequired: true, loading: false });
+  }
+
+  if (auth.loading) {
+    return <AuthLoadingScreen />;
   }
 
   if (!auth.loading && auth.authRequired && !auth.user) {
@@ -1004,6 +1008,21 @@ function TopNav({ user, logout }) {
         <button className="nav-icon-button" type="button" onClick={logout} title="Sign out"><LogOut size={18} /></button>
       </div>
     </header>
+  );
+}
+
+function AuthLoadingScreen() {
+  return (
+    <main className="login-shell">
+      <div className="login-card">
+        <div className="brand-card">
+          <div className="brand-mark"><Navigation size={22} /></div>
+          <span>Fitsol</span>
+        </div>
+        <h1>Green Logistics</h1>
+        <p>Checking your session...</p>
+      </div>
+    </main>
   );
 }
 
