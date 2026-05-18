@@ -1176,7 +1176,7 @@ h1 {
 .detail-tabs {
   display: grid;
   gap: 18px;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 .detail-tabs > div {

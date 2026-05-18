@@ -1578,8 +1578,8 @@ function Overview({ vehicles, tasks, clientHubs, parkings }) {
         <MetricCard icon={Zap} label="Vehicles active" value={activeVehicles} />
         <MetricCard icon={CircleAlert} label="Vehicles offline" value={offlineVehicles} />
         <MetricCard icon={MapPin} label="Vehicles at parking" value={vehiclesAtParking} />
-        <MetricCard icon={Gauge} label="Carbon saved today vs CNG" value={carbonSaved ? `${formatNumber(carbonSaved)} kg` : 'Not available'} />
-        <MetricCard icon={Route} label="Carbon saved per km" value={carbonPerKm ? `${formatNumber(carbonPerKm)} kg/km` : 'Not available'} />
+        <MetricCard icon={Gauge} label="Carbon saved today vs CNG" value={`${formatNumber(carbonSaved)} kg`} />
+        <MetricCard icon={Route} label="Carbon saved per km" value={`${formatNumber(carbonPerKm)} kg/km`} />
         <MetricCard icon={CircleAlert} label="Pending ops tasks" value={pending} />
       </div>
       <CarbonTrendPanel
@@ -1821,7 +1821,7 @@ function VehicleCard({ vehicle, driverContact, selected, onClick }) {
       </div>
       <div className="split">
         <Info label="Driver" value={safeValue(driverContact?.name || vehicle.driver, 'No driver')} />
-        <Info label="Driver email" value={safeValue(driverContact?.email, 'Not available')} />
+        <Info label="Driver email" value={safeValue(driverContact?.email, 'No driver email')} />
       </div>
       <div className="battery-line">
         <div>
@@ -1838,8 +1838,8 @@ function VehicleCard({ vehicle, driverContact, selected, onClick }) {
       <div className="insight-grid">
         <Info label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} strong />
         <Info label="Average speed" value={safeValue(avgSpeedLabel)} />
-        <Info label="Energy today" value={safeValue(vehicle.energy)} />
-        <Info label="Battery temp" value={safeValue(vehicle.temp)} />
+        <Info label="Last stop" value={safeValue(vehicle.lastStop, 'No stop recorded today')} />
+        <Info label="Source" value={safeValue(vehicle.sourceSystem, 'Telemetry source pending')} />
       </div>
       <Info label="Last update" value={safeValue(lastUpdatedLabel)} />
     </button>
@@ -2263,6 +2263,13 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
   const lastUpdatedLabel = formatRelativeTimestamp(vehicle.lastUpdated);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   const placeLabel = useNearPlaceLabel(vehicle?.lat, vehicle?.lng);
+  const trip = vehicle.trips?.[0] || {
+    title: 'Latest stop',
+    location: vehicle.lastStop,
+    distanceTodayKm: vehicle.todayDistance,
+    runningTime: vehicle.runningTime,
+    scrapedAt: vehicle.lastUpdated,
+  };
   return (
     <section className="detail-panel">
       <div className="detail-heading">
@@ -2301,9 +2308,14 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
           <p>Place status: {vehicle.locationState || 'Not assigned to a hub/parking geofence'}</p>
           {vehicle.hubGmpLink && <p><ActionLink href={vehicle.hubGmpLink} icon={MapPin} label="Open hub map" /></p>}
           {vehicle.parkingGmpLink && <p><ActionLink href={vehicle.parkingGmpLink} icon={ParkingCircle} label="Open parking map" /></p>}
-          <p>Energy today: {safeValue(vehicle.energy)}</p>
-          <p>Battery temperature: {safeValue(vehicle.temp)}</p>
           <p>Carbon basis: {safeValue(vehicle.confidence, 'Estimated vs CNG')}</p>
+        </div>
+        <div>
+          <h3>Trips</h3>
+          <p>{safeValue(trip.title, 'Latest stop')}: {safeValue(trip.location, 'No stop recorded today')}</p>
+          <p>Distance today: {formatNumber(trip.distanceTodayKm)} km</p>
+          <p>Running time: {safeValue(trip.runningTime, '0h 0m')}</p>
+          <p>Scraped: {safeValue(formatRelativeTimestamp(trip.scrapedAt), lastUpdatedLabel)}</p>
         </div>
       </div>
     </section>

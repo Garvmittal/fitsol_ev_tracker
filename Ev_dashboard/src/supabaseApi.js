@@ -188,16 +188,25 @@ function normalizeUser(row, email) {
 }
 
 async function getFleet(user) {
-  const [{ data: vehicles, error }, deployments, assignments] = await Promise.all([
+  const [{ data: vehicles, error }, deployments, assignments, snapshots, settingsPayload] = await Promise.all([
     supabase.from('vehicles').select('*').order('last_updated', { ascending: false }),
     listRows('deployments', 'created_at', false),
     listRows('driver_assignments', 'created_at', false),
+    listTodaySnapshots(),
+    getSettings(),
   ]);
   if (error) throw error;
   const latestDeployments = latestByKey((deployments || []).filter((row) => row.status !== 'Removed'), 'vehicle', 'created_at');
   const latestAssignments = latestByKey(assignments || [], 'vehicle', 'created_at');
+  const latestSnapshots = latestSnapshotByVehicle(snapshots || []);
+  const settings = settingsPayload?.settings || normalizeSettings();
   const rows = scopeRows(vehicles || [], user).map((vehicle, index) => (
-    mergeVehicleOpsData(normalizeVehicle(vehicle, index), latestDeployments.get(vehicleKey(vehicle.id)), latestAssignments.get(vehicleKey(vehicle.id)), index)
+    mergeVehicleOpsData(
+      normalizeVehicle(vehicle, index, latestSnapshots.get(vehicleKey(vehicle.id)), settings),
+      latestDeployments.get(vehicleKey(vehicle.id)),
+      latestAssignments.get(vehicleKey(vehicle.id)),
+      index,
+    )
   ));
   return { vehicles: rows, updatedAt: new Date().toISOString() };
 }
@@ -481,7 +490,7 @@ async function getCarbonTrend(periodValue) {
     .order('scraped_at', { ascending: true });
   if (error) throw error;
   const { settings } = await getSettings();
-  return { trend: buildCarbonTrend(data || [], period, settings) };
+  return { period, unit: 'kgCO2e', points: buildCarbonTrend(data || [], period, settings) };
 }
 
 async function getAlertPreview(user) {
@@ -561,6 +570,17 @@ async function listRows(table, orderBy = '', ascending = true) {
   return data || [];
 }
 
+async function listTodaySnapshots() {
+  const { data, error } = await supabase
+    .from('vehicle_snapshots')
+    .select('*')
+    .gte('scraped_at', todayStartIsoForIndia())
+    .order('scraped_at', { ascending: false })
+    .limit(10000);
+  if (error) throw error;
+  return data || [];
+}
+
 function normalizeClient(row) {
   return {
     client: row.name || row.client || '',
@@ -581,36 +601,58 @@ function normalizeClient(row) {
   };
 }
 
-function normalizeVehicle(row, index = 0) {
+function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = normalizeSettings()) {
+  const raw = latestSnapshot?.raw_payload || row.metadata || {};
+  const source = latestSnapshot || {};
+  const lat = toNumberOrUndefined(firstValue(source.latitude, raw.lat, row.lat, row.latitude));
+  const lng = toNumberOrUndefined(firstValue(source.longitude, raw.long, raw.lng, row.lng, row.longitude));
+  const todayDistance = toNumber(firstValue(source.distance_today_km, raw['Dist._today'], row.today_distance, row.distance_today_km));
+  const runningMinutes = numberOrNull(firstValue(source.today_running_minutes, raw['time today'], row.today_running_minutes));
+  const runningTime = minutesLabel(runningMinutes) || row.running_time || '0h 0m';
+  const avgSpeed = averageSpeedLabel(todayDistance, runningMinutes, firstValue(source.today_avg_speed_kmph, raw['average speed(calculated from distance and time)'], row.avg_speed));
+  const lastStop = firstText(source.last_stop_location_text, raw['last stop'], row.last_stop, row.last_stop_location_text, coordinateLabel(lat, lng), 'No stop recorded today');
+  const lastUpdated = firstText(source.scraped_at, row.last_updated, row.updated_at, row.created_at, '');
+  const carbonSaved = carbonSavedVsCng(todayDistance, settings);
+  const carbonRate = carbonRateVsCng(settings);
+  const model = firstText(source.vehicle_model, raw['vehicle model/model'], row.model, row.source_system, 'Model pending');
+  const sourceSystem = firstText(source.source, raw.source, row.source_system, 'Source pending');
+
   return {
     id: row.id || row.vehicle || `EV-${index + 1}`,
-    model: row.model || '',
-    sourceSystem: row.source_system || '',
+    model,
+    sourceSystem,
     client: row.client || 'Unassigned client',
     hub: row.hub || 'Unassigned hub',
     parking: row.parking || 'Parking unavailable',
-    status: normalizeStatus(row.status),
-    battery: Number(row.battery ?? row.battery_percent) || 0,
+    status: normalizeStatus(firstValue(source.movement_status_raw, raw['current status of vehicle'], row.status)),
+    battery: Number(firstValue(source.battery_percent, raw['battery%'], row.battery, row.battery_percent)) || 0,
     distance: Number(row.distance) || 0,
-    todayDistance: Number(row.today_distance ?? row.distance_today_km) || 0,
-    runningTime: row.running_time || minutesLabel(row.today_running_minutes) || 'Unavailable',
-    avgSpeed: row.avg_speed || 'Unavailable',
-    temp: row.temp || 'Unavailable',
-    odometer: row.odometer || 'Unavailable',
-    energy: row.energy || 'Unavailable',
+    todayDistance,
+    runningTime,
+    avgSpeed,
+    temp: firstText(row.temp, raw.battery_temperature_c, 'Not recorded'),
+    odometer: firstText(source.odometer_km, raw.odometer, row.odometer, 'Not recorded'),
+    energy: '',
     eta: row.eta || 'Unavailable',
     etaDate: row.eta_date || '',
-    lastUpdated: row.last_updated || 'Unavailable',
+    lastUpdated,
     driverState: row.driver_state || 'none',
     driver: row.driver || 'No driver confirmed yet',
-    driverMeta: row.driver_meta || 'Loaded from Supabase',
-    route: row.route || 'Route unavailable',
-    location: row.location || row.location_text || 'Location unavailable',
-    lastStop: row.last_stop || row.last_stop_location_text || 'Last stop unavailable',
-    carbon: row.carbon || 'Unavailable',
-    confidence: row.carbon_confidence || 'Unavailable',
-    lat: toNumberOrUndefined(row.lat ?? row.latitude),
-    lng: toNumberOrUndefined(row.lng ?? row.longitude),
+    driverMeta: row.driver_meta || 'Driver session not connected',
+    route: lastStop,
+    location: firstText(row.location, row.location_text, lastStop, coordinateLabel(lat, lng), 'Location pending'),
+    lastStop,
+    carbon: `${carbonSaved.toFixed(1)} kgCO2e`,
+    confidence: `Estimated from distance x ${carbonRate.toFixed(3)} kgCO2e/km vs CNG`,
+    trips: [{
+      title: 'Latest stop',
+      location: lastStop,
+      distanceTodayKm: todayDistance,
+      runningTime,
+      scrapedAt: lastUpdated,
+    }],
+    lat,
+    lng,
     x: 34 + (index % 8) * 6,
     y: 38 + (index % 5) * 8,
   };
@@ -759,15 +801,27 @@ function buildMovementAlerts(records, settings) {
 
 function buildCarbonTrend(records, period, settings) {
   const bucketMap = new Map(trendBuckets(period).map((bucket) => [bucket.key, { ...bucket, value: 0 }]));
+  const latestByBucketVehicle = new Map();
   records.forEach((record) => {
     const date = new Date(record.scraped_at || record.last_updated || record.created_at || 0);
     if (Number.isNaN(date.getTime())) return;
     const key = period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10);
     const bucket = bucketMap.get(key);
     if (!bucket) return;
+    const vehicle = vehicleKey(record.vehicle_number || record.vehicle_id || record.id);
+    if (!vehicle) return;
+    const mapKey = `${key}:${vehicle}`;
+    const previous = latestByBucketVehicle.get(mapKey);
+    const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() : -1;
+    if (date.getTime() < previousTime) return;
+    latestByBucketVehicle.set(mapKey, record);
+  });
+  latestByBucketVehicle.forEach((record, mapKey) => {
+    const key = mapKey.split(':')[0];
+    const bucket = bucketMap.get(key);
+    if (!bucket) return;
     const distance = Number(record.distance_today_km ?? record.today_distance ?? 0);
-    const energy = Number(record.energy_today_kwh ?? 0);
-    const carbon = carbonSavedVsCng(distance, energy, settings);
+    const carbon = carbonSavedVsCng(distance, settings);
     if (Number.isFinite(carbon)) bucket.value += carbon;
   });
   return [...bucketMap.values()].map((bucket) => ({ label: bucket.label, value: Number(bucket.value.toFixed(2)) }));
@@ -833,6 +887,28 @@ function latestByKey(rows, key, timeKey) {
   return latest;
 }
 
+function latestSnapshotByVehicle(rows) {
+  const latest = new Map();
+  rows.forEach((row) => {
+    const id = vehicleKey(row.vehicle_number || row.vehicle || row.vehicle_id || row.id);
+    if (!id) return;
+    const currentTime = new Date(row.scraped_at || row.created_at || 0).getTime() || 0;
+    const previous = latest.get(id);
+    const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() || 0 : -1;
+    if (currentTime >= previousTime) latest.set(id, row);
+  });
+  return latest;
+}
+
+function firstValue(...values) {
+  return values.find((value) => value !== undefined && value !== null && String(value).trim() !== '' && String(value).trim() !== 'Unavailable');
+}
+
+function firstText(...values) {
+  const value = firstValue(...values);
+  return value === undefined ? '' : String(value).trim();
+}
+
 function locationStateFor(vehicle, deployment) {
   if (!Number.isFinite(vehicle.lat) || !Number.isFinite(vehicle.lng)) return 'Location unavailable';
   const vehicleCoords = { lat: vehicle.lat, lng: vehicle.lng };
@@ -892,12 +968,15 @@ function trendBuckets(period) {
   });
 }
 
-function carbonSavedVsCng(distanceKm, energyKwh, settings) {
+function carbonRateVsCng(settings) {
+  const cngEmissionsPerKm = settings.cngConsumption * settings.cngFactor;
+  const evEmissionsPerKm = settings.evEnergy * settings.electricityFactor;
+  return Math.max(0, cngEmissionsPerKm - evEmissionsPerKm);
+}
+
+function carbonSavedVsCng(distanceKm, settings) {
   if (!distanceKm) return 0;
-  const evEnergy = energyKwh || distanceKm * settings.evEnergy;
-  const cngEmissions = distanceKm * settings.cngConsumption * settings.cngFactor;
-  const electricityEmissions = evEnergy * settings.electricityFactor;
-  return Math.max(0, cngEmissions - electricityEmissions);
+  return Math.max(0, distanceKm * carbonRateVsCng(settings));
 }
 
 function normalizeStatus(value) {
@@ -931,10 +1010,34 @@ function toNumber(value) {
 
 function minutesLabel(value) {
   const minutes = Number(value);
-  if (!Number.isFinite(minutes) || !minutes) return '';
+  if (!Number.isFinite(minutes)) return '';
   const hours = Math.floor(minutes / 60);
   const mins = Math.round(minutes % 60);
-  return hours ? `${hours}h ${mins}m` : `${mins}m`;
+  return `${hours}h ${mins}m`;
+}
+
+function averageSpeedLabel(distanceKm, runningMinutes, fallback = '') {
+  const distance = Number(distanceKm);
+  const minutes = Number(runningMinutes);
+  if (Number.isFinite(distance) && Number.isFinite(minutes) && minutes > 0) {
+    return `${(distance / (minutes / 60)).toFixed(1)} km/h`;
+  }
+  const fallbackNumber = Number(fallback);
+  if (Number.isFinite(fallbackNumber)) return `${fallbackNumber.toFixed(1)} km/h`;
+  const fallbackText = String(fallback || '').trim();
+  if (fallbackText && !/unavailable/i.test(fallbackText)) return fallbackText;
+  return distance ? 'Needs review' : '0 km/h';
+}
+
+function todayStartIsoForIndia() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const part = (type) => parts.find((item) => item.type === type)?.value;
+  return new Date(`${part('year')}-${part('month')}-${part('day')}T00:00:00+05:30`).toISOString();
 }
 
 function previousDateKey() {
