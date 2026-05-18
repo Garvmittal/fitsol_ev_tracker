@@ -230,7 +230,7 @@ function App() {
   const [drivers, setDrivers] = useState([]);
   const initialParkingSeed = (() => {
     const names = Array.from(new Set(vehiclesSeed.map((v) => v.parking).filter(Boolean)));
-    return names.map((name, idx) => ({ id: `P${idx + 1}`, name, totalSpaces: 10, spacesLeft: 10, gmpLink: '' }));
+    return names.map((name, idx) => ({ id: `P${idx + 1}`, name, location: '', gmpLink: '', lat: undefined, lng: undefined }));
   })();
   const [parkings, setParkings] = useState(initialParkingSeed);
   const [driverSession, setDriverSession] = useState('Ready');
@@ -265,9 +265,9 @@ function App() {
     }
   }
 
-  async function addParkingSite({ name, location, gmpLink, totalSpaces }) {
+  async function addParkingSite({ name, location, gmpLink }) {
     const trimmedName = String(name || '').trim();
-    if (!trimmedName) return false;
+    if (!trimmedName) return { ok: false, error: 'Parking name is required.' };
     try {
       const payload = await apiJson('/api/parking-sites', {
         method: 'POST',
@@ -275,44 +275,23 @@ function App() {
           name: trimmedName,
           location: String(location || '').trim(),
           gmpLink: String(gmpLink || '').trim(),
-          totalSpaces: Number(totalSpaces) || 0,
         }),
       });
       if (payload.parkings) setParkings(payload.parkings);
       setToast('Parking added.');
       window.setTimeout(() => setToast(''), 2400);
-      return true;
+      return { ok: true, error: '' };
     } catch (error) {
-      setToast(error.message || 'Unable to add parking.');
+      const message = error.message || 'Unable to add parking.';
+      setToast(message);
       window.setTimeout(() => setToast(''), 2600);
-      return false;
+      return { ok: false, error: message };
     }
   }
 
-  async function updateParkingSiteSpaces(parkingId, nextSpaces) {
-    try {
-      const payload = await apiJson(`/api/parking-sites/${encodeURIComponent(parkingId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ totalSpaces: Number(nextSpaces) || 0 }),
-      });
-      if (payload.parkings) setParkings(payload.parkings);
-      setToast('Parking spaces updated.');
-      window.setTimeout(() => setToast(''), 2400);
-    } catch (error) {
-      setToast(error.message || 'Unable to update parking.');
-      window.setTimeout(() => setToast(''), 2600);
-    }
-  }
-
-  // Compatibility: Operations ParkingManager currently calls addParking/updateParkingSpaces.
-  function addParking({ name, totalSpaces, gmpLink }) {
-    addParkingSite({ name, location: '', gmpLink, totalSpaces });
-  }
-
-  function updateParkingSpaces(name, nextSpaces) {
-    const match = (parkings || []).find((p) => p.name === name);
-    if (!match) return;
-    updateParkingSiteSpaces(match.parkingId || match.id, nextSpaces);
+  // Compatibility: keep the legacy Operations helpers that expect `addParking`.
+  function addParking({ name, gmpLink }) {
+    addParkingSite({ name, location: '', gmpLink });
   }
 
   const selected = vehicles.find((vehicle) => vehicle.id === selectedId) || vehicles[0];
@@ -487,29 +466,23 @@ function App() {
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
-    if (parkings.some((parking) => !Number.isFinite(Number(parking.spaces)) || Number(parking.spaces) < 0)) {
-      setToast('Add parking spaces as zero or more.');
+    try {
+      const payload = await apiJson('/api/client-hubs', {
+        method: 'POST',
+        body: JSON.stringify({
+          client,
+          gstNumber,
+          clientPoc,
+          hubs: hubs.map((hub) => `${hub.name} | ${hub.gmpLink}`).join('\n'),
+          parkings: parkings.map((parking) => `${parking.name} | ${parking.gmpLink}`).join('\n'),
+        }),
+      });
+      setClientHubs(payload.clients || []);
+    } catch (error) {
+      setToast(error.message || 'Unable to save client hubs.');
       window.setTimeout(() => setToast(''), 2600);
       return false;
     }
-    const response = await fetch('/api/client-hubs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client,
-        gstNumber,
-        clientPoc,
-        hubs: hubs.map((hub) => `${hub.name} | ${hub.gmpLink}`).join('\n'),
-        parkings: parkings.map((parking) => `${parking.name} | ${parking.gmpLink} | ${parking.spaces}`).join('\n'),
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      setToast(payload.error || payload.message || 'Unable to save client hubs.');
-      window.setTimeout(() => setToast(''), 2600);
-      return false;
-    }
-    setClientHubs(payload.clients || []);
     formElement.reset();
     setToast('Client saved for reuse.');
     window.setTimeout(() => setToast(''), 2600);
@@ -518,9 +491,7 @@ function App() {
 
   async function reloadClientHubs() {
     try {
-      const response = await fetch('/api/client-hubs');
-      if (!response.ok) throw new Error('Unable to load client hubs');
-      const payload = await response.json();
+      const payload = await apiJson('/api/client-hubs', { method: 'GET' });
       if (payload.clients) setClientHubs(payload.clients);
     } catch (error) {
       // ignore
@@ -529,9 +500,7 @@ function App() {
 
   async function reloadDrivers() {
     try {
-      const response = await fetch('/api/drivers');
-      if (!response.ok) throw new Error('Unable to load drivers');
-      const payload = await response.json();
+      const payload = await apiJson('/api/drivers', { method: 'GET' });
       if (payload.drivers) setDrivers(payload.drivers);
     } catch (error) {
       // ignore
@@ -554,13 +523,10 @@ function App() {
     }
 
     try {
-      const response = await fetch('/api/drivers', {
+      const payload = await apiJson('/api/drivers', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, phone, licenseNumber, dob, email }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || payload.message || 'Unable to save driver');
       if (payload.drivers) setDrivers(payload.drivers);
       event.currentTarget.reset();
       setToast('Driver added.');
@@ -597,12 +563,12 @@ function App() {
     if (!existingVehicle) {
       setToast('Choose a vehicle from the live Sheet fleet.');
       window.setTimeout(() => setToast(''), 2600);
-      return;
+      return false;
     }
     if (!canScheduleVehicleForDeployment(existingVehicle)) {
       setToast('Vehicle must be offline or already deployed before scheduling.');
       window.setTimeout(() => setToast(''), 2600);
-      return;
+      return false;
     }
     const deployment = {
       client: String(form.get('client') || '').trim(),
@@ -633,7 +599,7 @@ function App() {
     if (!deployment.client || !deployment.hub || !hubCoords || !deployment.parking || !parkingCoords || !deployment.deployAt || !deployment.layoverParking || !layoverCoords) {
       setToast('Choose client, hub, parking, deployment date/time, and layover parking.');
       window.setTimeout(() => setToast(''), 2600);
-      return;
+      return false;
     }
     deployment.hubLat = hubCoords.lat;
     deployment.hubLng = hubCoords.lng;
@@ -669,11 +635,8 @@ function App() {
     } catch (error) {
       setToast(error.message || 'Unable to save deployment.');
       window.setTimeout(() => setToast(''), 2600);
-      return;
+      return false;
     }
-    // decrement spacesLeft for the selected parking if it's managed in global parkings
-    setParkings((current) => current.map((p) => (p.name === deployment.parking ? { ...p, spacesLeft: Math.max(0, (p.spacesLeft || 0) - 1) } : p)));
-
     setVehicles((current) => current.map((vehicle) => (
       vehicle.id === vehicleId
         ? {
@@ -690,6 +653,7 @@ function App() {
     formElement.reset();
     setToast('Existing Sheet vehicle assigned to client hub.');
     window.setTimeout(() => setToast(''), 2600);
+    return true;
   }
 
   async function removeDeployment(event) {
@@ -768,6 +732,24 @@ function App() {
     setToast('Vehicle removed from client deployment.');
     window.setTimeout(() => setToast(''), 2600);
     return true;
+  }
+
+  async function scheduleDeploymentEnd({ vehicle, reason, effectiveAt, parking, driverChoice }) {
+    if (!vehicle || !effectiveAt || !parking) return null;
+    try {
+      const payload = await apiJson('/api/deployments/end', {
+        method: 'POST',
+        body: JSON.stringify({ vehicle, reason, effectiveAt, parking, driverChoice }),
+      });
+      if (payload.task) setTasks((current) => [payload.task, ...current]);
+      setToast('Undeploy scheduled and task created.');
+      window.setTimeout(() => setToast(''), 2400);
+      return { vehicle, reason, effectiveAt, parking, driverChoice };
+    } catch (error) {
+      setToast(error.message || 'Unable to schedule undeploy.');
+      window.setTimeout(() => setToast(''), 2600);
+      return null;
+    }
   }
 
   function exportReport() {
@@ -867,36 +849,32 @@ function App() {
   async function requestOtp(event) {
     event.preventDefault();
     setLoginMessage('Sending OTP...');
-    const response = await fetch('/api/auth/request-otp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: loginEmail }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      setLoginMessage(payload.error || payload.message || 'Unable to send OTP');
-      return;
+    try {
+      const payload = await apiJson('/api/auth/request-otp', {
+        method: 'POST',
+        body: JSON.stringify({ email: loginEmail }),
+      });
+      setOtpSent(true);
+      setLoginMessage(payload.devOtp ? `OTP sent. Dev OTP: ${payload.devOtp}` : 'OTP sent to your email.');
+    } catch (error) {
+      setLoginMessage(error.message || 'Unable to send OTP');
     }
-    setOtpSent(true);
-    setLoginMessage(payload.devOtp ? `OTP sent. Dev OTP: ${payload.devOtp}` : 'OTP sent to your email.');
   }
 
   async function verifyOtp(event) {
     event.preventDefault();
-    const response = await fetch('/api/auth/verify-otp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: loginEmail, otp }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      setLoginMessage(payload.error || 'Invalid OTP');
-      return;
+    try {
+      const payload = await apiJson('/api/auth/verify-otp', {
+        method: 'POST',
+        body: JSON.stringify({ email: loginEmail, otp }),
+      });
+      setAuth((current) => ({ ...current, user: payload.user }));
+      setLoginMessage('');
+      setOtp('');
+      setOtpSent(false);
+    } catch (error) {
+      setLoginMessage(error.message || 'Invalid OTP');
     }
-    setAuth((current) => ({ ...current, user: payload.user }));
-    setLoginMessage('');
-    setOtp('');
-    setOtpSent(false);
   }
 
   async function logout() {
@@ -976,30 +954,27 @@ function App() {
 	        {activeTab === 'Parking' && (
 	          <ParkingHub
 	            parkings={parkings}
+	            vehicles={vehicles}
 	            addParkingSite={addParkingSite}
-	            updateParkingSiteSpaces={updateParkingSiteSpaces}
 	          />
 	        )}
 	        
 	        {activeTab === 'Operations' && (
           <OperationsHub
             addClient={addClient}
-            addDeployment={addDeployment}
-            removeDeployment={removeDeployment}
-            removeDeploymentNow={endDeploymentNow}
             assignments={driverAssignments}
-            assignDriver={assignDriver}
             clientHubs={clientHubs}
-            driverSession={driverSession}
+            drivers={drivers}
+            addDriver={addDriver}
+            addDeployment={addDeployment}
             markTaskDone={markTaskDone}
             openFleet={() => setActiveTab('EV Fleet')}
-            selected={selected}
             selectVehicle={setSelectedId}
             tasks={tasks}
             vehicles={vehicles}
             parkings={parkings}
-            addParking={addParking}
-            updateParkingSpaces={updateParkingSpaces}
+            addParkingSite={addParkingSite}
+            scheduleDeploymentEnd={scheduleDeploymentEnd}
           />
         )}
         {activeTab === 'Admin' && (
@@ -1059,45 +1034,422 @@ function LoginScreen({ email, setEmail, otp, setOtp, otpSent, requestOtp, verify
   );
 }
 
-function OperationsHub({ addClient, addDeployment, removeDeployment, removeDeploymentNow, assignments, assignDriver, clientHubs, driverSession, markTaskDone, openFleet, selected, selectVehicle, tasks, vehicles, parkings, addParking, updateParkingSpaces }) {
-  const [opsTab, setOpsTab] = useState('Deployments');
+function OperationsHub({
+  addClient,
+  addDeployment,
+  assignments,
+  clientHubs,
+  drivers,
+  addDriver,
+  parkings,
+  addParkingSite,
+  markTaskDone,
+  openFleet,
+  selectVehicle,
+  tasks,
+  vehicles,
+  scheduleDeploymentEnd,
+}) {
+  const [deployOpen, setDeployOpen] = useState(false);
+  const [endTarget, setEndTarget] = useState(null);
+  const [clientModalOpen, setClientModalOpen] = useState(false);
+  const [parkingModalOpen, setParkingModalOpen] = useState(false);
+  const [driverModalOpen, setDriverModalOpen] = useState(false);
+  const [scheduledEnds, setScheduledEnds] = useState(() => new Map());
+
+  const latestAssignmentByVehicle = useMemo(() => {
+    const map = new Map();
+    (assignments || []).forEach((row) => {
+      const id = String(row.vehicle || '').trim().toUpperCase();
+      if (!id) return;
+      const t = new Date(row.createdAt || row.created_at || row.updatedAt || row.updated_at || row.shiftDate || 0).getTime() || 0;
+      const prev = map.get(id);
+      const pt = prev ? (new Date(prev.createdAt || prev.created_at || prev.updatedAt || prev.updated_at || prev.shiftDate || 0).getTime() || 0) : -1;
+      if (t >= pt) map.set(id, row);
+    });
+    return map;
+  }, [assignments]);
+
+  const deployed = useMemo(() => vehicles.filter(hasClientDeployment), [vehicles]);
+  const tableRows = useMemo(() => deployed.map((vehicle) => {
+    const assignment = latestAssignmentByVehicle.get(vehicle.id);
+    const scheduled = scheduledEnds.get(vehicle.id);
+    return {
+      vehicle,
+      assignment,
+      scheduled,
+      defaultDriver: safeValue(vehicle.driver, 'Not set'),
+      currentDriver: assignment?.name ? `${assignment.name}${assignment.email ? ` (${assignment.email})` : ''}` : 'Not assigned',
+    };
+  }), [deployed, latestAssignmentByVehicle, scheduledEnds]);
+
+  const visibleRows = tableRows.slice(0, 10);
+
+  async function handleScheduleEnd(payload) {
+    const result = await scheduleDeploymentEnd(payload);
+    if (result?.vehicle && result?.effectiveAt) {
+      setScheduledEnds((current) => {
+        const next = new Map(current);
+        next.set(result.vehicle, { effectiveAt: result.effectiveAt, parking: result.parking, reason: result.reason, driverChoice: result.driverChoice });
+        return next;
+      });
+      return true;
+    }
+    return false;
+  }
+
   return (
-    <section className="operations-shell">
-      <div className="operations-tabs" role="tablist" aria-label="Operations navigation">
-        {['Deployments', 'Tasks'].map((tab) => (
-          <button
-            key={tab}
-            type="button"
-            role="tab"
-            aria-selected={opsTab === tab}
-            className={opsTab === tab ? 'tab active' : 'tab'}
-            onClick={() => setOpsTab(tab)}
-          >
-            {tab}
-          </button>
-        ))}
+    <section className="operations-v2">
+      <div className="panel-title">
+        <div className="panel-title-stack">
+          <h2>Operations</h2>
+          <p className="form-note">Manage deployments and ops tasks without breaking the workflow.</p>
+        </div>
+        <button className="primary-action compact-action" type="button" onClick={() => setDeployOpen(true)}>
+          <Plus size={18} /> Deploy vehicle
+        </button>
       </div>
-      <div className="operations-content">
-        {opsTab === 'Deployments' && (
-          <div className="operations-grid">
-            <Deployments addClient={addClient} addDeployment={addDeployment} removeDeployment={removeDeployment} removeDeploymentNow={removeDeploymentNow} clientHubs={clientHubs} vehicles={vehicles} parkings={parkings} />
-            <div className="operations-side">
-              <DriverAssignments
-                assignments={assignments}
-                assignDriver={assignDriver}
-                driverSession={driverSession}
-                selected={selected}
-                vehicles={vehicles}
-              />
-              <ParkingManager parkings={parkings} addParking={addParking} updateParkingSpaces={updateParkingSpaces} />
-            </div>
+
+      <div className="table-panel ops-deployments-panel">
+        <div className="panel-title">
+          <div>
+            <h3>Active Deployments</h3>
+            <p className="form-note">{deployed.length} deployed vehicle(s)</p>
+          </div>
+          <button className="ghost-action compact-action" type="button" onClick={openFleet}><MapPin size={17} /> View fleet</button>
+        </div>
+
+        <div className="table-wrap ops-table-wrap" role="region" aria-label="Deployments table">
+          <table className="ops-table">
+            <thead>
+              <tr>
+                <th>Vehicle</th>
+                <th>Client</th>
+                <th>Hub</th>
+                <th>Parking</th>
+                <th>Default driver</th>
+                <th>Current driver</th>
+                <th>Status</th>
+                <th className="ops-action-col">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleRows.length ? visibleRows.map(({ vehicle, currentDriver, defaultDriver, scheduled }) => (
+                <tr key={vehicle.id}>
+                  <td>
+                    <button className="ghost-link" type="button" onClick={() => selectVehicle(vehicle.id)}>{vehicle.id}</button>
+                  </td>
+                  <td>{safeValue(vehicle.client, 'Unassigned client')}</td>
+                  <td>{safeValue(vehicle.hub, 'Unassigned hub')}</td>
+                  <td>{safeValue(vehicle.parking, 'Parking unavailable')}</td>
+                  <td>{defaultDriver}</td>
+                  <td>{currentDriver}</td>
+                  <td>
+                    {scheduled
+                      ? <span className="status-pill warning">Ending {relativeTimeFromNow(new Date(scheduled.effectiveAt).getTime() || Date.now())}</span>
+                      : <span className="status-pill success">Active</span>}
+                  </td>
+                  <td className="ops-action-col">
+                    <button className="primary-action compact-action danger" type="button" onClick={() => setEndTarget(vehicle)}>
+                      <X size={17} /> End
+                    </button>
+                  </td>
+                </tr>
+              )) : (
+                <tr>
+                  <td colSpan={8}>
+                    <div className="empty-state">No active deployments yet.</div>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <OpsActionCenter tasks={tasks} markTaskDone={markTaskDone} selectVehicle={selectVehicle} openFleet={openFleet} />
+
+      {deployOpen && (
+        <DeployVehicleModal
+          vehicles={vehicles}
+          clientHubs={clientHubs}
+          parkings={parkings}
+          drivers={drivers}
+          addDeployment={addDeployment}
+          closeModal={() => setDeployOpen(false)}
+          onOpenAddClient={() => setClientModalOpen(true)}
+          onOpenAddParking={() => setParkingModalOpen(true)}
+          onOpenAddDriver={() => setDriverModalOpen(true)}
+        />
+      )}
+
+      {endTarget && (
+        <EndDeploymentModal
+          vehicle={endTarget}
+          parkings={parkings}
+          drivers={drivers}
+          closeModal={() => setEndTarget(null)}
+          onOpenAddParking={() => setParkingModalOpen(true)}
+          onOpenAddDriver={() => setDriverModalOpen(true)}
+          scheduleEnd={async (payload) => {
+            const ok = await handleScheduleEnd(payload);
+            if (ok) setEndTarget(null);
+          }}
+        />
+      )}
+
+      {clientModalOpen && <ClientOnboardingModal addClient={async (event) => { const ok = await addClient(event); if (ok) setClientModalOpen(false); }} closeModal={() => setClientModalOpen(false)} />}
+      {parkingModalOpen && <ParkingOnboardingModal addParkingSite={async (data) => { const result = await addParkingSite(data); if (result?.ok) setParkingModalOpen(false); return result; }} closeModal={() => setParkingModalOpen(false)} />}
+      {driverModalOpen && <DriverOnboardingModal addDriver={async (event) => { const ok = await addDriver(event); if (ok) setDriverModalOpen(false); }} closeModal={() => setDriverModalOpen(false)} />}
+    </section>
+  );
+}
+
+function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeployment, closeModal, onOpenAddClient, onOpenAddParking, onOpenAddDriver }) {
+  const [vehicleId, setVehicleId] = useState(vehicles[0]?.id || '');
+  const [client, setClient] = useState(clientHubs[0]?.client || '');
+  const [hub, setHub] = useState('');
+  const [parking, setParking] = useState('');
+  const [deployAt, setDeployAt] = useState(new Date(Date.now() + 15 * 60 * 1000).toISOString().slice(0, 16));
+  const [reason, setReason] = useState('');
+  const [undeployAt, setUndeployAt] = useState('');
+  const [useTransientParking, setUseTransientParking] = useState(false);
+  const [transientParking, setTransientParking] = useState('');
+  const [defaultDriverEmail, setDefaultDriverEmail] = useState('');
+
+  const selectedVehicle = vehicles.find((v) => v.id === vehicleId) || vehicles[0];
+  const deployedAlready = hasClientDeployment(selectedVehicle);
+
+  const selectedClientRecord = clientHubs.find((item) => item.client === client) || clientHubs[0];
+  const hubs = normalizeLocationRecords(selectedClientRecord?.hubs);
+  const clientParkings = normalizeLocationRecords(selectedClientRecord?.parkings);
+  const globalParkings = Array.isArray(parkings) ? parkings.map((p) => ({ name: p.name, gmpLink: p.gmpLink || '' })) : [];
+  const combinedParkings = [...clientParkings, ...globalParkings];
+
+  useEffect(() => {
+    if (!hubs.some((h) => h.name === hub)) setHub(hubs[0]?.name || '');
+  }, [hubs, hub]);
+
+  useEffect(() => {
+    if (!combinedParkings.some((p) => p.name === parking)) setParking(combinedParkings[0]?.name || '');
+    if (!combinedParkings.some((p) => p.name === transientParking)) setTransientParking(combinedParkings[0]?.name || '');
+  }, [combinedParkings, parking, transientParking]);
+
+  const vehicleBarTone = (vehicle) => {
+    const isDeployed = hasClientDeployment(vehicle);
+    const isRunning = String(vehicle.status || '').toLowerCase().includes('run');
+    if (!isDeployed) return 'good';
+    if (isRunning) return 'bad';
+    return 'warn';
+  };
+
+  const driverOptions = useMemo(() => (drivers || []).map((d) => ({ id: d.driverId || d.id, label: `${d.name}${d.phone ? ` • ${d.phone}` : ''}`, email: d.email, name: d.name })), [drivers]);
+
+  const selectedHub = hubs.find((h) => h.name === hub);
+  const selectedParking = combinedParkings.find((p) => p.name === parking);
+  const selectedTransient = combinedParkings.find((p) => p.name === transientParking);
+  const layoverParking = deployedAlready && useTransientParking ? selectedTransient : selectedParking;
+
+  async function handleSubmit(event) {
+    // Build a form-shaped submit so we reuse the existing addDeployment handler (keeps state updates consistent).
+    // eslint-disable-next-line no-param-reassign
+    event.currentTarget.querySelector('input[name=\"vehicle\"]').value = vehicleId;
+    event.currentTarget.querySelector('input[name=\"client\"]').value = client;
+    event.currentTarget.querySelector('input[name=\"hub\"]').value = hub;
+    event.currentTarget.querySelector('input[name=\"hubGmpLink\"]').value = selectedHub?.gmpLink || '';
+    event.currentTarget.querySelector('input[name=\"parking\"]').value = parking;
+    event.currentTarget.querySelector('input[name=\"parkingGmpLink\"]').value = selectedParking?.gmpLink || '';
+    event.currentTarget.querySelector('input[name=\"deployAt\"]').value = new Date(deployAt).toISOString();
+    event.currentTarget.querySelector('input[name=\"previousUndeployAt\"]').value = deployedAlready ? (undeployAt ? new Date(undeployAt).toISOString() : '') : '';
+    event.currentTarget.querySelector('input[name=\"layoverParking\"]').value = layoverParking?.name || parking;
+    event.currentTarget.querySelector('input[name=\"layoverParkingGmpLink\"]').value = layoverParking?.gmpLink || selectedParking?.gmpLink || '';
+    event.currentTarget.querySelector('input[name=\"usage\"]').value = reason;
+    event.currentTarget.querySelector('input[name=\"poc\"]').value = '';
+
+    const ok = await addDeployment(event);
+    if (ok) closeModal();
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="modal-card client-hub-form add-client-modal ops-deploy-modal" onSubmit={handleSubmit}>
+        <div className="panel-title">
+          <h2>Deploy Vehicle</h2>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
+        </div>
+
+        <div className="ops-vehicle-picker">
+          <div className="ops-vehicle-picker-title">
+            <strong>Select vehicle</strong>
+            <span className="form-note">Red: deployed & running, Yellow: deployed, Green: undeployed</span>
+          </div>
+          <div className="ops-vehicle-list" role="list">
+            {vehicles.map((v) => (
+              <button
+                key={v.id}
+                type="button"
+                className={v.id === vehicleId ? `ops-vehicle-item active ${vehicleBarTone(v)}` : `ops-vehicle-item ${vehicleBarTone(v)}`}
+                onClick={() => setVehicleId(v.id)}
+              >
+                <span className="ops-vehicle-id">{v.id}</span>
+                <span className="ops-vehicle-meta">{deploymentStatusLabel(v)}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="ops-form-row">
+          <label>Client<select value={client} onChange={(e) => setClient(e.target.value)} required>{clientHubs.map((c) => <option key={c.client} value={c.client}>{c.client}</option>)}</select></label>
+          <button className="ghost-action compact-action" type="button" onClick={onOpenAddClient}><Plus size={16} /> Add client</button>
+        </div>
+
+        <label>Hub<select value={hub} onChange={(e) => setHub(e.target.value)} required>{hubs.map((h) => <option key={h.name} value={h.name}>{h.name}</option>)}</select></label>
+
+        {combinedParkings.length ? (
+          <div className="ops-form-row">
+            <label>Parking<select value={parking} onChange={(e) => setParking(e.target.value)} required>{combinedParkings.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}</select></label>
+            <button className="ghost-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={16} /> Add parking</button>
+          </div>
+        ) : (
+          <div className="empty-location">
+            <strong>Parking not found</strong>
+            <button className="primary-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={18} /> Add parking</button>
           </div>
         )}
-        {opsTab === 'Tasks' && (
-          <OpsActionCenter tasks={tasks} markTaskDone={markTaskDone} selectVehicle={selectVehicle} openFleet={openFleet} />
+
+        <label>Deployment effective from<input type="datetime-local" value={deployAt} onChange={(e) => setDeployAt(e.target.value)} required /></label>
+
+        {deployedAlready && (
+          <>
+            <label>Reason for change<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why are we changing deployment?" required /></label>
+            <label>Undeploy effective from<input type="datetime-local" value={undeployAt} onChange={(e) => setUndeployAt(e.target.value)} required /></label>
+            <label className="checkbox-line">
+              <input type="checkbox" checked={useTransientParking} onChange={(e) => setUseTransientParking(e.target.checked)} />
+              <span>Transient parking required between undeploy & deploy</span>
+            </label>
+            {useTransientParking && (
+              combinedParkings.length ? (
+                <div className="ops-form-row">
+                  <label>Transient parking<select value={transientParking} onChange={(e) => setTransientParking(e.target.value)} required>{combinedParkings.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}</select></label>
+                  <button className="ghost-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={16} /> Add parking</button>
+                </div>
+              ) : null
+            )}
+          </>
         )}
-      </div>
-    </section>
+
+        <div className="ops-form-row">
+          <label>Default driver (optional)
+            <select value={defaultDriverEmail} onChange={(e) => setDefaultDriverEmail(e.target.value)}>
+              <option value="">Use existing default ({safeValue(selectedVehicle?.driver, 'Not set')})</option>
+              {driverOptions.map((d) => <option key={d.id} value={d.email}>{d.label}</option>)}
+            </select>
+          </label>
+          <button className="ghost-action compact-action" type="button" onClick={onOpenAddDriver}><Plus size={16} /> Add driver</button>
+        </div>
+        <p className="form-note">Driver selection is recorded in ops notes for now; driver-to-vehicle mapping remains managed under Drivers.</p>
+
+        {/* hidden fields expected by addDeployment */}
+        <input type="hidden" name="vehicle" defaultValue={vehicleId} />
+        <input type="hidden" name="client" defaultValue={client} />
+        <input type="hidden" name="hub" defaultValue={hub} />
+        <input type="hidden" name="hubGmpLink" defaultValue={selectedHub?.gmpLink || ''} />
+        <input type="hidden" name="hubLat" defaultValue="" />
+        <input type="hidden" name="hubLng" defaultValue="" />
+        <input type="hidden" name="parking" defaultValue={parking} />
+        <input type="hidden" name="parkingGmpLink" defaultValue={selectedParking?.gmpLink || ''} />
+        <input type="hidden" name="parkingLat" defaultValue="" />
+        <input type="hidden" name="parkingLng" defaultValue="" />
+        <input type="hidden" name="deployAt" defaultValue="" />
+        <input type="hidden" name="previousUndeployAt" defaultValue="" />
+        <input type="hidden" name="layoverParking" defaultValue="" />
+        <input type="hidden" name="layoverParkingGmpLink" defaultValue="" />
+        <input type="hidden" name="layoverParkingLat" defaultValue="" />
+        <input type="hidden" name="layoverParkingLng" defaultValue="" />
+        <input type="hidden" name="usage" defaultValue="" />
+        <input type="hidden" name="poc" defaultValue="" />
+
+        <div className="modal-actions">
+          <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
+          <button className="primary-action" type="submit"><Check size={18} /> Save deployment</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function EndDeploymentModal({ vehicle, parkings, drivers, closeModal, onOpenAddParking, onOpenAddDriver, scheduleEnd }) {
+  const [reason, setReason] = useState('');
+  const [effectiveAt, setEffectiveAt] = useState(new Date(Date.now() + 15 * 60 * 1000).toISOString().slice(0, 16));
+  const [parking, setParking] = useState(parkings?.[0]?.name || '');
+  const [useDefaultDriver, setUseDefaultDriver] = useState(true);
+  const [driverEmail, setDriverEmail] = useState('');
+
+  const driverOptions = useMemo(() => (drivers || []).map((d) => ({ id: d.driverId || d.id, label: `${d.name}${d.phone ? ` • ${d.phone}` : ''}`, email: d.email })), [drivers]);
+
+  useEffect(() => {
+    if (!parkings?.some((p) => p.name === parking)) setParking(parkings?.[0]?.name || '');
+  }, [parkings, parking]);
+
+  async function submit(event) {
+    event.preventDefault();
+    const choice = useDefaultDriver ? `Default (${safeValue(vehicle.driver, 'Not set')})` : (driverEmail || 'Unspecified');
+    await scheduleEnd({
+      vehicle: vehicle.id,
+      reason,
+      effectiveAt: new Date(effectiveAt).toISOString(),
+      parking,
+      driverChoice: choice,
+    });
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="modal-card client-hub-form add-client-modal ops-end-modal" onSubmit={submit}>
+        <div className="panel-title">
+          <h2>End Deployment</h2>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
+        </div>
+        <label>Vehicle<input value={`${vehicle.id} • ${safeValue(vehicle.client, '')}`} readOnly /></label>
+        <label>Reason<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Completed, returned, reassigned..." required /></label>
+        <label>Undeploy effective from<input type="datetime-local" value={effectiveAt} onChange={(e) => setEffectiveAt(e.target.value)} required /></label>
+
+        {parkings?.length ? (
+          <div className="ops-form-row">
+            <label>Park at<select value={parking} onChange={(e) => setParking(e.target.value)} required>{parkings.map((p) => <option key={p.parkingId || p.id} value={p.name}>{p.name}</option>)}</select></label>
+            <button className="ghost-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={16} /> Add parking</button>
+          </div>
+        ) : (
+          <div className="empty-location">
+            <strong>Parking not found</strong>
+            <button className="primary-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={18} /> Add parking</button>
+          </div>
+        )}
+
+        <div className="ops-driver-choice">
+          <div className="ops-driver-choice-title"><strong>Driver for this ops task</strong></div>
+          <label className="checkbox-line">
+            <input type="radio" name="driverChoice" checked={useDefaultDriver} onChange={() => setUseDefaultDriver(true)} />
+            <span>Use default driver ({safeValue(vehicle.driver, 'Not set')})</span>
+          </label>
+          <label className="checkbox-line">
+            <input type="radio" name="driverChoice" checked={!useDefaultDriver} onChange={() => setUseDefaultDriver(false)} />
+            <span>Assign a different driver</span>
+          </label>
+          {!useDefaultDriver && (
+            <div className="ops-form-row">
+              <label>Driver<select value={driverEmail} onChange={(e) => setDriverEmail(e.target.value)} required>{driverOptions.map((d) => <option key={d.id} value={d.email}>{d.label}</option>)}</select></label>
+              <button className="ghost-action compact-action" type="button" onClick={onOpenAddDriver}><Plus size={16} /> Add driver</button>
+            </div>
+          )}
+        </div>
+
+        <div className="modal-actions">
+          <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
+          <button className="primary-action danger" type="submit"><Check size={18} /> Schedule undeploy</button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -1721,7 +2073,6 @@ function buildMapMarkers(vehicles, selectedId, globalParkings = []) {
       title: `Parking site: ${p.name}`,
       details: [
         ['Parking', p.name],
-        ['Spaces left', p.spacesLeft ?? 'N/A'],
       ],
     });
   });
@@ -1876,7 +2227,6 @@ function distanceMeters(a, b) {
 }
 
 function VehicleDetail({ vehicle, parkings = [], driverContact }) {
-  const parkingRecord = (parkings || []).find((p) => p.name === vehicle.parking);
   const lastUpdatedLabel = formatRelativeTimestamp(vehicle.lastUpdated);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   const placeLabel = useNearPlaceLabel(vehicle?.lat, vehicle?.lng);
@@ -1901,7 +2251,7 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
           <h3>Now</h3>
           <p>Current location: {safeValue(placeLabel || vehicle.location)}</p>
           <p>Last stop: {safeValue(vehicle.lastStop)}</p>
-          <p>Assigned parking: {safeValue(vehicle.parking)}{parkingRecord?.spacesLeft !== undefined ? ` · ${parkingRecord.spacesLeft} spaces left` : ''}</p>
+          <p>Assigned parking: {safeValue(vehicle.parking)}</p>
           <p>Average speed: {safeValue(avgSpeedLabel)}</p>
           <p>Last update: {safeValue(lastUpdatedLabel)}</p>
         </div>
@@ -2232,32 +2582,38 @@ function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDri
   );
 }
 
-function ParkingHub({ parkings = [], addParkingSite, updateParkingSiteSpaces }) {
+function ParkingHub({ parkings = [], vehicles = [], addParkingSite }) {
   const [parkingModalOpen, setParkingModalOpen] = useState(false);
-  const [editing, setEditing] = useState(null);
-  const [editSpaces, setEditSpaces] = useState('');
   const [parkingQuery, setParkingQuery] = useState('');
 
   const filtered = useMemo(() => {
     const q = parkingQuery.trim().toLowerCase();
     if (!q) return parkings;
     return parkings.filter((p) => {
-      const haystack = [p.name, p.location, p.gmpLink, String(p.totalSpaces ?? ''), String(p.spacesLeft ?? '')].join(' ').toLowerCase();
+      const haystack = [p.name, p.location, p.gmpLink].join(' ').toLowerCase();
       return haystack.includes(q);
     });
   }, [parkings, parkingQuery]);
 
-  function beginEdit(parking) {
-    setEditing(parking);
-    setEditSpaces(String(parking.totalSpaces ?? ''));
-  }
-
-  async function saveEdit() {
-    if (!editing) return;
-    await updateParkingSiteSpaces(editing.parkingId || editing.id, editSpaces);
-    setEditing(null);
-    setEditSpaces('');
-  }
+  const parkedCountBySite = useMemo(() => {
+    const map = new Map();
+    (parkings || []).forEach((p) => {
+      const key = p.parkingId || p.id || p.name;
+      const coords = coordsFromFields(p.lat, p.lng) || extractMapCoords(p.gmpLink);
+      if (!key || !coords) {
+        if (key) map.set(key, 0);
+        return;
+      }
+      let count = 0;
+      (vehicles || []).forEach((v) => {
+        const vCoords = coordsFromFields(v.lat, v.lng);
+        if (!vCoords) return;
+        if (distanceMeters(vCoords, coords) <= 100) count += 1;
+      });
+      map.set(key, count);
+    });
+    return map;
+  }, [parkings, vehicles]);
 
   return (
     <section className="table-panel">
@@ -2279,8 +2635,7 @@ function ParkingHub({ parkings = [], addParkingSite, updateParkingSiteSpaces }) 
               <tr>
                 <th>Name</th>
                 <th>Location</th>
-                <th>Spaces</th>
-                <th />
+                <th>Vehicles parked</th>
               </tr>
             </thead>
             <tbody>
@@ -2294,12 +2649,7 @@ function ParkingHub({ parkings = [], addParkingSite, updateParkingSiteSpaces }) 
                       'Not added'
                     )}
                   </td>
-                  <td>{p.totalSpaces ?? 0}</td>
-                  <td>
-                    <button className="ghost-action compact-action" type="button" onClick={() => beginEdit(p)} title="Edit spaces">
-                      <Pencil size={17} />
-                    </button>
-                  </td>
+                  <td>{parkedCountBySite.get(p.parkingId || p.id || p.name) ?? 0}</td>
                 </tr>
               ))}
             </tbody>
@@ -2310,31 +2660,12 @@ function ParkingHub({ parkings = [], addParkingSite, updateParkingSiteSpaces }) 
       )}
 
       {parkingModalOpen && <ParkingOnboardingModal addParkingSite={addParkingSite} closeModal={() => setParkingModalOpen(false)} />}
-
-      {editing && (
-        <div className="modal-backdrop" role="presentation">
-          <div className="modal-card add-client-modal">
-            <div className="panel-title">
-              <h2>Edit Parking</h2>
-              <button className="ghost-action compact-action" type="button" onClick={() => setEditing(null)}><X size={17} /> Close</button>
-            </div>
-            <label>Name<input value={editing.name} readOnly /></label>
-            <label>Google Maps link<input value={editing.gmpLink || ''} readOnly /></label>
-            <MapLinkPreview link={editing.gmpLink} />
-            <label>Number of spaces<input value={editSpaces} onChange={(e) => setEditSpaces(e.target.value)} type="number" min="0" required /></label>
-            <div className="modal-actions">
-              <button className="ghost-action" type="button" onClick={() => setEditing(null)}>Cancel</button>
-              <button className="primary-action" type="button" onClick={saveEdit}><Check size={18} /> Save</button>
-            </div>
-          </div>
-        </div>
-      )}
     </section>
   );
 }
 
 function ParkingOnboardingModal({ addParkingSite, closeModal }) {
-  const [formState, setFormState] = useState({ name: '', location: '', gmpLink: '', totalSpaces: 0 });
+  const [formState, setFormState] = useState({ name: '', location: '', gmpLink: '' });
   const [error, setError] = useState('');
 
   function onChange(patch) {
@@ -2349,8 +2680,10 @@ function ParkingOnboardingModal({ addParkingSite, closeModal }) {
       setError(info.message || 'Use a valid Google Maps link.');
       return;
     }
-    const ok = await addParkingSite(formState);
-    if (ok) closeModal();
+    const result = await addParkingSite(formState);
+    if (result?.ok) closeModal();
+    else if (result?.error) setError(result.error);
+    else setError('Unable to add parking.');
   }
 
   return (
@@ -2364,7 +2697,6 @@ function ParkingOnboardingModal({ addParkingSite, closeModal }) {
         <label>Location<input value={formState.location} onChange={(e) => onChange({ location: e.target.value })} placeholder="Location label (e.g. Hosur)" required /></label>
         <label>Google Maps link<input value={formState.gmpLink} onChange={(e) => onChange({ gmpLink: e.target.value })} placeholder="https://www.google.com/maps/..." required /></label>
         <MapLinkPreview link={formState.gmpLink} />
-        <label>Number of spaces<input value={formState.totalSpaces} onChange={(e) => onChange({ totalSpaces: e.target.value })} type="number" min="0" required /></label>
         {error ? <p className="form-note">{error}</p> : null}
         <div className="modal-actions">
           <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
@@ -2414,7 +2746,7 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
   const selectedClientRecord = clientHubs.find((item) => item.client === selectedClient) || clientHubs[0];
   const hubs = normalizeLocationRecords(selectedClientRecord?.hubs);
   const clientParkings = normalizeLocationRecords(selectedClientRecord?.parkings);
-  const globalParkings = Array.isArray(parkings) ? parkings.map((p) => ({ name: p.name, gmpLink: p.gmpLink || '', lat: p.lat, lng: p.lng, totalSpaces: p.totalSpaces, spacesLeft: p.spacesLeft })) : [];
+  const globalParkings = Array.isArray(parkings) ? parkings.map((p) => ({ name: p.name, gmpLink: p.gmpLink || '', lat: p.lat, lng: p.lng })) : [];
   const combinedParkings = [...clientParkings, ...globalParkings];
   const selectedHubRecord = hubs.find((hub) => hub.name === selectedHub) || hubs[0];
   const selectedParkingRecord = combinedParkings.find((parking) => parking.name === selectedParking) || combinedParkings[0];
@@ -2475,13 +2807,13 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
         <input name="hubGmpLink" type="hidden" value={selectedHubRecord?.gmpLink || ''} />
         <input name="hubLat" type="hidden" value={selectedHubRecord?.lat || ''} />
         <input name="hubLng" type="hidden" value={selectedHubRecord?.lng || ''} />
-        <label>Nearest parking<select name="parking" value={selectedParking} onChange={(event) => setSelectedParking(event.target.value)} required>{combinedParkings.map((parking) => <option key={parking.name} value={parking.name}>{parking.name}{parking.spacesLeft !== undefined ? ` (${parking.spacesLeft} left)` : ''}</option>)}</select></label>
+        <label>Nearest parking<select name="parking" value={selectedParking} onChange={(event) => setSelectedParking(event.target.value)} required>{combinedParkings.map((parking) => <option key={parking.name} value={parking.name}>{parking.name}</option>)}</select></label>
         <input name="parkingGmpLink" type="hidden" value={selectedParkingRecord?.gmpLink || ''} />
         <input name="parkingLat" type="hidden" value={selectedParkingRecord?.lat || ''} />
         <input name="parkingLng" type="hidden" value={selectedParkingRecord?.lng || ''} />
         {endPrevious && <label>Undeploy previous site at<input name="previousUndeployAt" type="datetime-local" required /></label>}
         <label>Deploy at<input name="deployAt" type="datetime-local" required /></label>
-        <label>Layover parking<select name="layoverParking" value={selectedLayoverParking} onChange={(event) => setSelectedLayoverParking(event.target.value)} required>{combinedParkings.map((parking) => <option key={parking.name} value={parking.name}>{parking.name}{parking.spacesLeft !== undefined ? ` (${parking.spacesLeft} left)` : ''}</option>)}</select></label>
+        <label>Layover parking<select name="layoverParking" value={selectedLayoverParking} onChange={(event) => setSelectedLayoverParking(event.target.value)} required>{combinedParkings.map((parking) => <option key={parking.name} value={parking.name}>{parking.name}</option>)}</select></label>
         <input name="layoverParkingGmpLink" type="hidden" value={selectedLayoverParkingRecord?.gmpLink || ''} />
         <input name="layoverParkingLat" type="hidden" value={selectedLayoverParkingRecord?.lat || ''} />
         <input name="layoverParkingLng" type="hidden" value={selectedLayoverParkingRecord?.lng || ''} />
@@ -2540,7 +2872,7 @@ function ClientOnboardingModal({ addClient, closeModal }) {
   const updateParking = (index, patch) => setParkings((current) => current.map((parking, itemIndex) => (itemIndex === index ? { ...parking, ...patch } : parking)));
   const removeParking = (index) => setParkings((current) => current.filter((_, itemIndex) => itemIndex !== index));
   const hubPayload = hubs.map((hub) => `${hub.name.trim()} | ${normalizeMapLink(hub.gmpLink)}`).join('\n');
-  const parkingPayload = parkings.map((parking) => `${parking.name.trim()} | ${normalizeMapLink(parking.gmpLink)} | ${parking.spaces ?? ''}`).join('\n');
+  const parkingPayload = parkings.map((parking) => `${parking.name.trim()} | ${normalizeMapLink(parking.gmpLink)}`).join('\n');
   const pocPayload = [poc.name, poc.email, poc.phone].map((value) => value.trim()).filter(Boolean).join(' | ');
 
   return (
@@ -2579,14 +2911,13 @@ function ClientOnboardingModal({ addClient, closeModal }) {
         <div className="location-editor">
           <div className="location-editor-title">
             <strong>Parking</strong>
-            <button className="ghost-action compact-action" type="button" onClick={() => setParkings((current) => [...current, { name: '', gmpLink: '', spaces: 0 }])}><Plus size={16} /> Add parking</button>
+            <button className="ghost-action compact-action" type="button" onClick={() => setParkings((current) => [...current, { name: '', gmpLink: '' }])}><Plus size={16} /> Add parking</button>
           </div>
           {parkings.map((parking, index) => (
             <LocationEditorCard
               key={`parking-${index}`}
               item={parking}
               label="Parking"
-              withSpaces
               onChange={(patch) => updateParking(index, patch)}
               canRemove
               onRemove={() => removeParking(index)}
@@ -2603,13 +2934,12 @@ function ClientOnboardingModal({ addClient, closeModal }) {
   );
 }
 
-function LocationEditorCard({ item, label, withSpaces = false, onChange, canRemove = false, onRemove }) {
+function LocationEditorCard({ item, label, onChange, canRemove = false, onRemove }) {
   return (
     <article className="location-editor-card">
       <div className="location-editor-fields">
         <label>{label} name<input value={item.name} onChange={(event) => onChange({ name: event.target.value })} placeholder={`${label} name`} required /></label>
         <label>Google Maps link<input value={item.gmpLink} onChange={(event) => onChange({ gmpLink: event.target.value })} placeholder="https://www.google.com/maps/..." required /></label>
-        {withSpaces && <label>Parking spaces<input value={item.spaces ?? ''} onChange={(event) => onChange({ spaces: event.target.value })} type="number" min="0" required /></label>}
       </div>
       <MapLinkPreview link={item.gmpLink} />
       {canRemove && <button className="ghost-action compact-action remove-location" type="button" onClick={onRemove}><X size={16} /> Remove</button>}
@@ -2671,16 +3001,15 @@ function DriverAssignments({ assignments, assignDriver, driverSession, selected,
   );
 }
 
-function ParkingManager({ parkings, addParking, updateParkingSpaces }) {
+function ParkingManager({ parkings, addParking }) {
   const [name, setName] = useState('');
-  const [spaces, setSpaces] = useState(10);
   const [gmpLink, setGmpLink] = useState('');
 
   function handleAdd(event) {
     event.preventDefault();
     if (!name) return;
-    addParking({ name: name.trim(), totalSpaces: Number(spaces) || 0, gmpLink: gmpLink.trim() });
-    setName(''); setSpaces(10); setGmpLink('');
+    addParking({ name: name.trim(), gmpLink: gmpLink.trim() });
+    setName(''); setGmpLink('');
   }
 
   return (
@@ -2691,7 +3020,6 @@ function ParkingManager({ parkings, addParking, updateParkingSpaces }) {
       </div>
       <form className="inline-form" onSubmit={handleAdd}>
         <label>Name<input value={name} onChange={(e) => setName(e.target.value)} placeholder="Parking name" required /></label>
-        <label>Spaces<input value={spaces} onChange={(e) => setSpaces(e.target.value)} type="number" min="0" /></label>
         <label>Google Maps link<input value={gmpLink} onChange={(e) => setGmpLink(e.target.value)} placeholder="https://maps.google.com/..." /></label>
         <button className="primary-action" type="submit"><Plus size={16} /> Add Parking</button>
       </form>
@@ -2701,10 +3029,6 @@ function ParkingManager({ parkings, addParking, updateParkingSpaces }) {
             <div>
               <strong>{p.name}</strong>
               <p>{p.gmpLink ? <a href={p.gmpLink} target="_blank" rel="noreferrer">link</a> : 'No map link'}</p>
-            </div>
-            <div className="task-actions">
-              <label>Spaces<input defaultValue={p.totalSpaces} type="number" onBlur={(e) => updateParkingSpaces(p.name, Number(e.target.value) || 0)} /></label>
-              <small>{p.spacesLeft ?? 'N/A'} left</small>
             </div>
           </article>
         ))}
@@ -2890,8 +3214,23 @@ async function apiJson(url, options = {}) {
       ...(options.headers || {}),
     },
   });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || payload.message || `Request failed (${response.status})`);
+  // Some upstream failures (proxy down, auth redirects, etc.) may return HTML.
+  // Read as text and then attempt JSON parse so we can surface a helpful message.
+  const raw = await response.text().catch(() => '');
+  let payload = {};
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    payload = {};
+  }
+  if (!response.ok) {
+    const message = payload.error || payload.message;
+    if (message) throw new Error(message);
+    if (raw && raw.trim().startsWith('<!DOCTYPE')) {
+      throw new Error('Backend returned an HTML error page. Make sure the API server is running (port 3001) and you are signed in.');
+    }
+    throw new Error(`Request failed (${response.status})`);
+  }
   return payload;
 }
 
@@ -2988,8 +3327,8 @@ function parseLocationLines(value) {
   return String(value || '')
     .split(/\r?\n/)
     .map((line) => {
-      const [name = '', gmpLink = '', spaces = ''] = line.trim().split('|').map((part) => part.trim());
-      return { name, gmpLink, spaces };
+      const [name = '', gmpLink = ''] = line.trim().split('|').map((part) => part.trim());
+      return { name, gmpLink };
     })
     .filter((item) => item.name || item.gmpLink);
 }

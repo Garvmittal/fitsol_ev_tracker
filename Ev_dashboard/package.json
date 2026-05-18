@@ -20,7 +20,8 @@
     "nodemailer": "latest",
     "pg": "^8.11.0",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "ws": "^8.20.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

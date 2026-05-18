@@ -40,6 +40,13 @@ const apiCacheSeconds = Number(process.env.API_CACHE_SECONDS || 30);
 const sheetRecordsCache = new Map();
 
 app.use(express.json());
+// Ensure JSON parse failures return JSON (not an HTML error page).
+app.use((err, _request, response, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return response.status(400).json({ error: 'Invalid JSON payload' });
+  }
+  return next(err);
+});
 
 app.get('/api/health', (_request, response) => {
   response.json({ ok: true });
@@ -168,6 +175,32 @@ app.get('/api/fleet', requirePermission('fleet'), async (request, response) => {
 
 app.get('/api/client-hubs', requirePermission('fleet'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const rawClients = await supabaseModule.listClientHubs();
+      const clients = (rawClients || []).map((row) => ({
+        client: row.name || row.client || '',
+        gstNumber: String(row.gst_number || row.gstNumber || '').trim(),
+        clientPoc: String(row.poc || row.client_poc || row.clientPoc || '').trim(),
+        hubs: (row.hubs || [])
+          .filter((hub) => hub && (hub.enabled === undefined || hub.enabled))
+          .map((hub) => ({
+            name: hub.name || '',
+            gmpLink: hub.gmp_link || hub.gmpLink || '',
+            lat: toNumber(hub.lat),
+            lng: toNumber(hub.lng),
+          })),
+        parkings: (row.parkings || [])
+          .filter((parking) => parking && (parking.enabled === undefined || parking.enabled))
+          .map((parking) => ({
+            name: parking.name || '',
+            gmpLink: parking.gmp_link || parking.gmpLink || '',
+            lat: toNumber(parking.lat),
+            lng: toNumber(parking.lng),
+          })),
+      })).filter((client) => canAccessClient(request.user, client.client));
+
+      return response.json({ clients });
+    }
     const sheets = await getSheetsClient();
     await ensureSheetWithHeaders(sheets, clientHubsSheetName, clientHubHeaders());
     await ensureSheetWithHeaders(sheets, clientParkingsSheetName, clientParkingHeaders());
@@ -194,7 +227,6 @@ app.post('/api/client-hubs', requirePermission('deployments'), async (request, r
     if (parkings.some((parking) => !parking.name || !parking.gmpLink)) return response.status(400).json({ error: 'Every parking point needs a name and Google Maps link' });
     if (hubs.some((hub) => !isValidGoogleMapsLink(hub.gmpLink))) return response.status(400).json({ error: 'Use valid Google Maps links with coordinates for each hub' });
     if (parkings.some((parking) => !isValidGoogleMapsLink(parking.gmpLink))) return response.status(400).json({ error: 'Use valid Google Maps links with coordinates for each parking point' });
-    if (parkings.some((parking) => normalizeParkingSpaces(parking.spaces) === null)) return response.status(400).json({ error: 'Parking spaces must be zero or more' });
     const sheets = await getSheetsClient();
     const hubHeaders = clientHubHeaders();
     const parkingHeaders = clientParkingHeaders();
@@ -219,8 +251,7 @@ app.post('/api/client-hubs', requirePermission('deployments'), async (request, r
       .filter((parking) => !existingParkingKeys.has(`${client.toLowerCase()}::${parking.name.toLowerCase()}`))
       .map((parking) => {
         const coords = extractMapCoords(parking.gmpLink) || {};
-        const spaces = normalizeParkingSpaces(parking.spaces) ?? 0;
-        return [client, parking.name, parking.gmpLink, coords.lat || '', coords.lng || '', spaces, spaces, 'TRUE', createdAt];
+        return [client, parking.name, parking.gmpLink, coords.lat || '', coords.lng || '', 'TRUE', createdAt];
       });
     if (useSupabase) {
       await upsertSupabaseClientLocations({
@@ -388,6 +419,64 @@ app.post('/api/deployments/remove', requirePermission('deployments'), async (req
   }
 });
 
+app.post('/api/deployments/end', requirePermission('deployments'), async (request, response) => {
+  try {
+    const vehicle = String(request.body?.vehicle || '').trim().toUpperCase();
+    const reason = String(request.body?.reason || '').trim();
+    const effectiveAt = String(request.body?.effectiveAt || '').trim();
+    const parking = String(request.body?.parking || '').trim();
+    const driverChoice = String(request.body?.driverChoice || '').trim(); // optional, stored in reason for now
+
+    if (!vehicle || !effectiveAt || !parking) {
+      return response.status(400).json({ error: 'Vehicle, effective time, and parking are required.' });
+    }
+
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, deploymentsSheetName, deploymentHeaders());
+    const rows = scopeRows(await getSheetRecords(sheets, deploymentsSheetName), request.user);
+    const activeDeployment = latestByKey(
+      rows.filter((row) => String(row.vehicle || '').trim().toUpperCase() === vehicle && normalizeBoolean(row.status || 'Active')),
+      'vehicle',
+      'created_at',
+    ).get(vehicle);
+
+    if (!activeDeployment?.deployment_id) return response.status(404).json({ error: 'No active client deployment found for this vehicle' });
+    if (!canAccessClient(request.user, activeDeployment.client)) return response.status(403).json({ error: 'You cannot update deployments for this client' });
+
+    const updated = await updateSheetRowById(
+      sheets,
+      deploymentsSheetName,
+      'deployment_id',
+      activeDeployment.deployment_id,
+      {
+        status: 'Ending',
+        removed_by: request.user.email || request.user.name,
+        removed_at: effectiveAt,
+        remove_reason: reason,
+      },
+      (row) => canAccessClient(request.user, row.client),
+    );
+
+    const taskReason = [reason, driverChoice ? `Driver: ${driverChoice}` : ''].filter(Boolean).join('; ');
+    const task = await createOpsTask(sheets, {
+      title: `Undeploy vehicle and park at ${parking}`,
+      vehicle,
+      client: activeDeployment.client,
+      hub: activeDeployment.hub,
+      parking,
+      poc: activeDeployment.poc || '',
+      due: effectiveAt,
+      reason: taskReason || 'Undeploy scheduled',
+      status: 'Pending',
+      created_by: request.user.email || request.user.name,
+    });
+
+    response.json({ ok: true, deployment: normalizeDeploymentRow(updated), task });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to schedule undeploy', message: error.message });
+  }
+});
+
 app.get('/api/driver-assignments', requirePermission(['drivers', 'driver']), async (request, response) => {
   try {
     const sheets = await getSheetsClient();
@@ -435,6 +524,10 @@ app.post('/api/driver-assignments', requirePermission('drivers'), async (request
 
 app.get('/api/drivers', requirePermission('drivers'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const drivers = await supabaseModule.listDrivers();
+      return response.json({ drivers: drivers.map(normalizeDriverSupabaseRow) });
+    }
     const sheets = await getSheetsClient();
     await ensureSheetWithHeaders(sheets, driversSheetName, driverHeaders());
     const rows = await getSheetRecords(sheets, driversSheetName);
@@ -446,6 +539,25 @@ app.get('/api/drivers', requirePermission('drivers'), async (request, response) 
 
 app.post('/api/drivers', requirePermission('drivers'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const record = {
+        driver_id: crypto.randomUUID(),
+        name: String(request.body?.name || '').trim(),
+        phone: String(request.body?.phone || '').trim(),
+        license_number: String(request.body?.licenseNumber || '').trim(),
+        dob: String(request.body?.dob || '').trim(),
+        email: normalizeEmail(request.body?.email),
+        created_by: request.user.email || request.user.name,
+        created_at: new Date().toISOString(),
+        updated_at: null,
+      };
+      if (!record.name || !record.phone || !record.license_number || !record.dob || !record.email) {
+        return response.status(400).json({ error: 'Name, phone, license number, DOB, and email are required' });
+      }
+      await supabaseModule.createDriver(record);
+      const drivers = await supabaseModule.listDrivers();
+      return response.json({ ok: true, drivers: drivers.map(normalizeDriverSupabaseRow) });
+    }
     const driver = {
       driver_id: crypto.randomUUID(),
       name: String(request.body?.name || '').trim(),
@@ -473,6 +585,15 @@ app.post('/api/drivers', requirePermission('drivers'), async (request, response)
 
 app.patch('/api/drivers/:driverId', requirePermission('drivers'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const driverId = String(request.params.driverId || '').trim();
+      const phone = String(request.body?.phone || '').trim();
+      if (!driverId) return response.status(400).json({ error: 'Driver id is required' });
+      if (!phone) return response.status(400).json({ error: 'Phone is required' });
+      await supabaseModule.updateDriverPhone(driverId, phone);
+      const drivers = await supabaseModule.listDrivers();
+      return response.json({ ok: true, drivers: drivers.map(normalizeDriverSupabaseRow) });
+    }
     const driverId = String(request.params.driverId || '').trim();
     const phone = String(request.body?.phone || '').trim();
     if (!driverId) return response.status(400).json({ error: 'Driver id is required' });
@@ -497,6 +618,10 @@ app.patch('/api/drivers/:driverId', requirePermission('drivers'), async (request
 
 app.get('/api/parking-sites', requirePermission('deployments'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const parkings = await supabaseModule.listParkingSites();
+      return response.json({ parkings: parkings.map(normalizeParkingSiteSupabaseRow) });
+    }
     const sheets = await getSheetsClient();
     await ensureSheetWithHeaders(sheets, parkingSitesSheetName, parkingSiteHeaders());
     const rows = await getSheetRecords(sheets, parkingSitesSheetName);
@@ -511,12 +636,28 @@ app.post('/api/parking-sites', requirePermission('deployments'), async (request,
     const name = String(request.body?.name || '').trim();
     const location = String(request.body?.location || '').trim();
     const gmpLink = String(request.body?.gmpLink || '').trim();
-    const spaces = normalizeParkingSpaces(request.body?.totalSpaces);
     if (!name) return response.status(400).json({ error: 'Parking name is required' });
     if (!location) return response.status(400).json({ error: 'Location is required' });
     if (!gmpLink) return response.status(400).json({ error: 'Google Maps link is required' });
     if (!isValidGoogleMapsLink(gmpLink)) return response.status(400).json({ error: 'Use a valid Google Maps link with coordinates' });
-    if (spaces === null) return response.status(400).json({ error: 'Spaces must be zero or more' });
+
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const coords = extractMapCoords(gmpLink) || {};
+      const record = {
+        parking_id: crypto.randomUUID(),
+        name,
+        location,
+        gmp_link: gmpLink,
+        lat: coords.lat || null,
+        lng: coords.lng || null,
+        created_by: request.user.email || request.user.name,
+        created_at: new Date().toISOString(),
+        updated_at: null,
+      };
+      await supabaseModule.createParkingSite(record);
+      const parkings = await supabaseModule.listParkingSites();
+      return response.json({ ok: true, parkings: parkings.map(normalizeParkingSiteSupabaseRow) });
+    }
 
     const coords = extractMapCoords(gmpLink) || {};
     const record = {
@@ -526,7 +667,6 @@ app.post('/api/parking-sites', requirePermission('deployments'), async (request,
       gmp_link: gmpLink,
       lat: coords.lat || '',
       lng: coords.lng || '',
-      total_spaces: spaces ?? 0,
       created_by: request.user.email || request.user.name,
       created_at: new Date().toISOString(),
       updated_at: '',
@@ -539,31 +679,6 @@ app.post('/api/parking-sites', requirePermission('deployments'), async (request,
     response.json({ ok: true, parkings: rows.map(normalizeParkingSiteRow).reverse() });
   } catch (error) {
     response.status(500).json({ error: 'Unable to save parking site', message: error.message });
-  }
-});
-
-app.patch('/api/parking-sites/:parkingId', requirePermission('deployments'), async (request, response) => {
-  try {
-    const parkingId = String(request.params.parkingId || '').trim();
-    const spaces = normalizeParkingSpaces(request.body?.totalSpaces);
-    if (!parkingId) return response.status(400).json({ error: 'Parking id is required' });
-    if (spaces === null) return response.status(400).json({ error: 'Spaces must be zero or more' });
-
-    const sheets = await getSheetsClient();
-    await ensureSheetWithHeaders(sheets, parkingSitesSheetName, parkingSiteHeaders());
-    const result = await updateSheetRowById(
-      sheets,
-      parkingSitesSheetName,
-      'parking_id',
-      parkingId,
-      { total_spaces: spaces ?? 0, updated_at: new Date().toISOString() },
-      () => true,
-    );
-    if (!result) return response.status(404).json({ error: 'Parking site not found' });
-    const rows = await getSheetRecords(sheets, parkingSitesSheetName);
-    response.json({ ok: true, parkings: rows.map(normalizeParkingSiteRow).reverse() });
-  } catch (error) {
-    response.status(500).json({ error: 'Unable to update parking site', message: error.message });
   }
 });
 
@@ -590,6 +705,10 @@ app.post('/api/driver-session', requirePermission('driver'), async (request, res
 
 app.get('/api/tasks', requirePermission('tasks'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const tasks = await supabaseModule.listOpsTasks();
+      return response.json({ tasks: tasks.map(normalizeTaskSupabaseRow) });
+    }
     const sheets = await getSheetsClient();
     await ensureSheetWithHeaders(sheets, opsTasksSheetName, opsTaskHeaders());
     const rows = scopeRows(await getSheetRecords(sheets, opsTasksSheetName), request.user);
@@ -601,6 +720,11 @@ app.get('/api/tasks', requirePermission('tasks'), async (request, response) => {
 
 app.post('/api/tasks/:taskId/done', requirePermission('tasks'), async (request, response) => {
   try {
+    if (useSupabase && supabaseModule?.isConfigured) {
+      const updated = await supabaseModule.markOpsTaskDone(request.params.taskId, request.user.email || request.user.name);
+      if (!updated) return response.status(404).json({ error: 'Task not found' });
+      return response.json({ ok: true, task: normalizeTaskSupabaseRow(updated) });
+    }
     const sheets = await getSheetsClient();
     await ensureSheetWithHeaders(sheets, opsTasksSheetName, opsTaskHeaders());
     const result = await updateSheetRowById(sheets, opsTasksSheetName, 'task_id', request.params.taskId, {
@@ -654,8 +778,8 @@ function parseHubInput(value) {
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => {
-        const [name = '', gmpLink = '', spaces = ''] = line.split('|').map((part) => part.trim());
-        return { name, gmpLink: normalizeMapLink(gmpLink), spaces };
+        const [name = '', gmpLink = ''] = line.split('|').map((part) => part.trim());
+        return { name, gmpLink: normalizeMapLink(gmpLink) };
       });
 }
 
@@ -692,12 +816,6 @@ function extractMapCoords(link) {
   const lat = Number(match[1]);
   const lng = Number(match[2]);
   return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
-}
-
-function normalizeParkingSpaces(value) {
-  if (value === undefined || value === null || String(value).trim() === '') return null;
-  const spaces = Number(value);
-  return Number.isFinite(spaces) && spaces >= 0 ? Math.floor(spaces) : null;
 }
 
 app.get('/api/alerts/preview', requirePermission('alerts'), async (request, response) => {
@@ -873,7 +991,9 @@ async function getFleetData(sheets) {
 }
 
 async function getAlertRecipients(sheets) {
-  const rows = await getSheetRecords(sheets, alertRecipientsSheetName);
+  // Alert recipients are managed in Google Sheets only.
+  const googleSheets = sheets?.spreadsheets ? sheets : await getGoogleSheetsClient();
+  const rows = await loadGoogleSheetRecords(googleSheets, alertRecipientsSheetName);
   return rows
     .map((row) => ({
       name: row.name || row.Name || '',
@@ -929,7 +1049,8 @@ function clientHubHeaders() {
 }
 
 function clientParkingHeaders() {
-  return ['client', 'parking', 'parking_gmp_link', 'parking_lat', 'parking_lng', 'total_spaces', 'spaces_left', 'active', 'created_at'];
+  // Parking capacity is no longer tracked in the portal.
+  return ['client', 'parking', 'parking_gmp_link', 'parking_lat', 'parking_lng', 'active', 'created_at'];
 }
 
 function driverAssignmentHeaders() {
@@ -941,7 +1062,8 @@ function driverHeaders() {
 }
 
 function parkingSiteHeaders() {
-  return ['parking_id', 'name', 'location', 'gmp_link', 'lat', 'lng', 'total_spaces', 'created_by', 'created_at', 'updated_at'];
+  // Parking capacity is no longer tracked in the portal.
+  return ['parking_id', 'name', 'location', 'gmp_link', 'lat', 'lng', 'created_by', 'created_at', 'updated_at'];
 }
 
 function opsTaskHeaders() {
@@ -1007,8 +1129,20 @@ function normalizeDriverRow(row) {
   };
 }
 
+function normalizeDriverSupabaseRow(row) {
+  return {
+    driverId: row.driver_id || row.driverId || row.driver_id || '',
+    name: row.name || '',
+    phone: row.phone || '',
+    licenseNumber: row.license_number || row.licenseNumber || '',
+    dob: row.dob || '',
+    email: normalizeEmail(row.email || ''),
+    createdAt: row.created_at || '',
+    updatedAt: row.updated_at || '',
+  };
+}
+
 function normalizeParkingSiteRow(row) {
-  const totalSpaces = toNumber(row.total_spaces) ?? 0;
   return {
     parkingId: row.parking_id || row.parkingId || '',
     name: row.name || '',
@@ -1016,8 +1150,19 @@ function normalizeParkingSiteRow(row) {
     gmpLink: row.gmp_link || row.gmpLink || row['Google Maps Link'] || '',
     lat: toNumber(row.lat),
     lng: toNumber(row.lng),
-    totalSpaces,
-    spacesLeft: totalSpaces,
+    createdAt: row.created_at || '',
+    updatedAt: row.updated_at || '',
+  };
+}
+
+function normalizeParkingSiteSupabaseRow(row) {
+  return {
+    parkingId: row.parking_id || row.parkingId || '',
+    name: row.name || '',
+    location: row.location || '',
+    gmpLink: row.gmp_link || row.gmpLink || '',
+    lat: toNumber(row.lat),
+    lng: toNumber(row.lng),
     createdAt: row.created_at || '',
     updatedAt: row.updated_at || '',
   };
@@ -1060,6 +1205,21 @@ async function createDeploymentTasks(sheets, deployment) {
 }
 
 function normalizeTaskRow(row) {
+  return {
+    id: row.task_id || row.id || '',
+    title: row.title || '',
+    vehicle: row.vehicle || '',
+    client: row.client || '',
+    hub: row.hub || '',
+    parking: row.parking || '',
+    poc: row.poc || '',
+    due: row.due || '',
+    reason: row.reason || '',
+    status: row.status || 'Pending',
+  };
+}
+
+function normalizeTaskSupabaseRow(row) {
   return {
     id: row.task_id || row.id || '',
     title: row.title || '',
@@ -1421,43 +1581,14 @@ function columnLetter(count) {
 }
 
 async function findUserByEmail(email) {
-  const sheets = await getSheetsClient();
-  await ensureSheetWithHeaders(sheets, authUsersSheetName, ['name', 'email', 'role', 'client', 'active']);
-  const rows = await getSheetRecords(sheets, authUsersSheetName);
-  if (!rows.length && defaultAdminEmail) {
-    if (useSupabase) {
-      const db = supabaseModule.getClient();
-      const { error } = await db.from('users').upsert({
-        name: defaultAdminName,
-        email: defaultAdminEmail,
-        role: 'admin',
-        client: '',
-        active: true,
-        permissions: ['all'],
-      }, { onConflict: 'email' });
-      if (error) throw error;
-      clearRecordsCache(authUsersSheetName);
-    } else {
-      await appendRecord(sheets, authUsersSheetName, ['name', 'email', 'role', 'client', 'active'], {
-        name: defaultAdminName,
-        email: defaultAdminEmail,
-        role: 'admin',
-        client: '',
-        active: 'TRUE',
-      });
-    }
-    rows.push({ name: defaultAdminName, email: defaultAdminEmail, role: 'admin', client: '', active: 'TRUE' });
-  }
+  // Portal access is managed in Google Sheets only.
+  const sheets = await getGoogleSheetsClient();
+  await ensureGoogleSheetWithHeaders(sheets, authUsersSheetName, ['name', 'email', 'role', 'client', 'active']);
+  const rows = await loadGoogleSheetRecords(sheets, authUsersSheetName);
   const match = rows.find((row) => normalizeEmail(row.email || row.Email) === email && normalizeBoolean(row.active ?? row.Active ?? 'TRUE'));
   if (!match) return null;
   const role = String(match.role || match.Role || 'client').toLowerCase();
-  return {
-    name: match.name || match.Name || email,
-    email,
-    role,
-    client: match.client || match.Client || '',
-    permissions: permissionsForRole(role),
-  };
+  return { name: match.name || match.Name || email, email, role, client: match.client || match.Client || '', permissions: permissionsForRole(role) };
 }
 
 async function getSheetRecords(sheets, sheetTitle) {
@@ -1479,22 +1610,13 @@ async function getSheetRecords(sheets, sheetTitle) {
 
 async function loadSheetRecords(sheets, sheetTitle) {
   if (useSupabase) {
+    // Even in Supabase-first mode, keep access/recipient lists in Google Sheets.
+    if (sheetTitle === authUsersSheetName || sheetTitle === alertRecipientsSheetName) {
+      const googleSheets = await getGoogleSheetsClient();
+      return loadGoogleSheetRecords(googleSheets, sheetTitle);
+    }
     const db = (sheets && sheets.supabase) || supabaseModule.getClient();
     try {
-      if (sheetTitle === authUsersSheetName) {
-        const { data } = await db.from('users').select('*');
-        return (data || []).map((u) => ({
-          name: u.name || '',
-          email: u.email,
-          role: u.role || ((u.permissions || []).includes('all') ? 'admin' : 'client'),
-          client: u.client || '',
-          active: u.active === false ? 'FALSE' : 'TRUE',
-        }));
-      }
-      if (sheetTitle === alertRecipientsSheetName) {
-        const { data } = await db.from('users').select('*');
-        return (data || []).filter((u) => u.active !== false).map((u) => ({ name: u.name || '', email: u.email, role: 'recipient', active: 'TRUE' }));
-      }
       if (sheetTitle === clientHubsSheetName) {
         const { data } = await db.from('clients').select('*, hubs(*)');
         const rows = [];
@@ -1519,8 +1641,6 @@ async function loadSheetRecords(sheets, sheetTitle) {
             parking_gmp_link: p.gmp_link || '',
             parking_lat: p.lat,
             parking_lng: p.lng,
-            total_spaces: p.total_spaces ?? '',
-            spaces_left: p.spaces_left ?? '',
             active: p.enabled ? 'TRUE' : 'FALSE',
             created_at: p.created_at,
           }));
@@ -1553,6 +1673,16 @@ async function loadSheetRecords(sheets, sheetTitle) {
       return [];
     }
   }
+  const range = `'${sheetTitle.replace(/'/g, "''")}'!A:ZZ`;
+  const result = await sheets.spreadsheets.values.get({ spreadsheetId, range, valueRenderOption: 'FORMATTED_VALUE' });
+  const [headers = [], ...rows] = result.data.values || [];
+  if (!headers.length) return [];
+  return rows
+    .filter((row) => row.some((value) => String(value || '').trim()))
+    .map((row) => Object.fromEntries(headers.map((header, index) => [String(header || '').trim(), row[index] ?? ''])));
+}
+
+async function loadGoogleSheetRecords(sheets, sheetTitle) {
   const range = `'${sheetTitle.replace(/'/g, "''")}'!A:ZZ`;
   const result = await sheets.spreadsheets.values.get({ spreadsheetId, range, valueRenderOption: 'FORMATTED_VALUE' });
   const [headers = [], ...rows] = result.data.values || [];
@@ -1681,10 +1811,8 @@ function groupClientHubs(rows, parkingRows = []) {
     const gmpLink = String(row.parking_gmp_link || row['Parking GMP Link'] || row.gmpLink || row['Google Maps Link'] || '').trim();
     const lat = toNumber(row.parking_lat || row['Parking Lat']);
     const lng = toNumber(row.parking_lng || row['Parking Lng']);
-    const totalSpaces = toNumber(row.total_spaces || row.totalSpaces || row['Total Spaces']);
-    const spacesLeft = toNumber(row.spaces_left || row.spacesLeft || row['Spaces Left']);
     const record = ensureClient(client, row);
-    if (record && parking) record.parkings.set(parking, { name: parking, gmpLink, lat, lng, totalSpaces, spacesLeft });
+    if (record && parking) record.parkings.set(parking, { name: parking, gmpLink, lat, lng });
   }
 
   return [...grouped.values()].map((record) => ({
@@ -1734,15 +1862,12 @@ async function upsertSupabaseClientLocations({
     .filter((parking) => !existingParkingKeys.has(`${client.toLowerCase()}::${parking.name.toLowerCase()}`))
     .map((parking) => {
       const coords = extractMapCoords(parking.gmpLink) || {};
-      const spaces = normalizeParkingSpaces(parking.spaces) ?? 0;
       return {
         client_id: clientId,
         name: parking.name,
         gmp_link: parking.gmpLink,
         lat: coords.lat || null,
         lng: coords.lng || null,
-        total_spaces: spaces,
-        spaces_left: spaces,
         enabled: true,
         created_at: createdAt,
       };
@@ -1762,6 +1887,35 @@ async function upsertSupabaseClientLocations({
 
 async function ensureSheetWithHeaders(sheets, sheetTitle, headers) {
   if (useSupabase) return; // Supabase tables don't need header enforcement
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets(properties(sheetId,title))',
+  });
+  const exists = metadata.data.sheets?.some((sheet) => sheet.properties?.title === sheetTitle);
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [{ addSheet: { properties: { title: sheetTitle } } }] },
+    });
+  }
+  const current = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${sheetTitle.replace(/'/g, "''")}'!A1:${String.fromCharCode(64 + headers.length)}1`,
+    valueRenderOption: 'FORMATTED_VALUE',
+  });
+  const existingHeaders = (current.data.values || [])[0] || [];
+  const hasRequiredHeaders = headers.every((header, index) => String(existingHeaders[index] || '').trim() === header);
+  if (!hasRequiredHeaders) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `'${sheetTitle.replace(/'/g, "''")}'!A1`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [headers] },
+    });
+  }
+}
+
+async function ensureGoogleSheetWithHeaders(sheets, sheetTitle, headers) {
   const metadata = await sheets.spreadsheets.get({
     spreadsheetId,
     fields: 'sheets(properties(sheetId,title))',
@@ -1880,6 +2034,14 @@ app.listen(port, '0.0.0.0', () => {
 
 async function getSheetsClient() {
   if (useSupabase) return { supabase: supabaseModule.getClient() };
+  const auth = new google.auth.GoogleAuth({
+    keyFile: credentialsPath,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  return google.sheets({ version: 'v4', auth });
+}
+
+async function getGoogleSheetsClient() {
   const auth = new google.auth.GoogleAuth({
     keyFile: credentialsPath,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],

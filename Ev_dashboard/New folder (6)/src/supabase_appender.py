@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import math
+import json
 from typing import Any
 
 import requests
@@ -42,9 +44,14 @@ class SupabaseVehicleAppender:
     def _post(self, path: str, payload: list[dict[str, Any]], prefer: str) -> None:
         if not payload:
             return
+        payload = _normalize_bulk_keys(payload)
+        safe_payload = _sanitize_json(payload)
+        # Supabase/PostgREST rejects NaN/Infinity in JSON; Python's default JSON encoder
+        # will emit them unless we both sanitize and disallow them at dump-time.
+        body = json.dumps(safe_payload, allow_nan=False, separators=(",", ":")).encode("utf-8")
         response = requests.post(
             f"{self.url}{path}",
-            json=payload,
+            data=body,
             timeout=45,
             headers={
                 "apikey": self.service_role_key,
@@ -53,6 +60,11 @@ class SupabaseVehicleAppender:
                 "Prefer": prefer,
             },
         )
+        if not response.ok:
+            # Help debug PostgREST validation errors without dumping secrets.
+            sample = safe_payload[:1] if isinstance(safe_payload, list) else safe_payload
+            print(f"[supabase_appender] POST {path} failed: {response.status_code} {response.text}")
+            print(f"[supabase_appender] payload_sample={json.dumps(sample, ensure_ascii=True)[:2000]}")
         response.raise_for_status()
 
     def _vehicle_payload(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -138,10 +150,44 @@ def _number(value: Any) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(str(value).replace(",", "").split()[0])
+        number = float(str(value).replace(",", "").split()[0])
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
 
 def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def _sanitize_json(value: Any) -> Any:
+    """Recursively convert Python values into strict JSON-safe values.
+
+    In particular, converts non-finite floats (NaN/Infinity) to None so PostgREST accepts the payload.
+    """
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json(v) for v in value]
+    if isinstance(value, dict):
+        # Ensure keys are strings and values are sanitized.
+        return {str(k): _sanitize_json(v) for k, v in value.items()}
+    # Fallback: stringify unknown objects (e.g., datetime, Decimal) to keep JSON encoding strict.
+    return str(value)
+
+
+def _normalize_bulk_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PostgREST requires all objects in a bulk insert to have identical keys."""
+    if not rows:
+        return rows
+    all_keys: set[str] = set()
+    for row in rows:
+        all_keys.update(row.keys())
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        normalized.append({key: row.get(key, None) for key in all_keys})
+    return normalized
