@@ -3328,28 +3328,28 @@ function normalizeVehicleRows(rows) {
       }
       return '';
     };
-    const vehicleNumber = String(get('id', 'vehicle_number', 'Vehicle number', 'Vehicle No', 'vehicle', 'registration')).trim();
+    const vehicleNumber = String(get('vehicle_number', 'Vehcile_no', 'vehicle_no', 'Vehicle number', 'Vehicle No', 'vehicle', 'registration', 'id')).trim();
     const lat = Number(get('latitude', 'lat', 'Current location latitude'));
     const lng = Number(get('longitude', 'lng', 'lon', 'Current location longitude'));
     return {
       id: vehicleNumber || `EV-${index + 1}`,
-      model: get('model', 'vehicle_model', 'Vehicle model', 'Make model') || '',
-      sourceSystem: get('source_system', 'Source system') || '',
+      model: get('model', 'vehicle_model', 'vehicle model/model', 'Vehicle model', 'Make model') || '',
+      sourceSystem: get('source_system', 'source', 'Source system') || '',
       client: get('client', 'Client') || 'Unassigned client',
       hub: get('hub', 'Client hub', 'Hub') || 'Unassigned hub',
       parking: get('parking', 'Parking location') || 'Parking unavailable',
-      status: normalizeStatus(get('status', 'Live status', 'Current status')),
-      battery: Number(get('battery', 'battery_percent', 'Current battery charge', 'soc')) || 0,
+      status: normalizeStatus(get('status', 'movement_status_raw', 'current status of vehicle', 'Live status', 'Current status')),
+      battery: Number(get('battery', 'battery_percent', 'battery%', 'Current battery charge', 'soc')) || 0,
       distance: Number(get('distance_left', 'Distance left')) || 0,
       todayDistance: Number(get('today_distance', 'distance_today_km', 'Dist._today', 'distance_today', 'Distance covered today', 'Distance covered')) || 0,
-      runningTime: get('running_time', 'today_running_minutes', 'time today', 'Running time today') || 'Unavailable',
-      avgSpeed: get('avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today') || 'Unavailable',
-      temp: get('temperature', 'Temperature') || 'Unavailable',
-      odometer: get('odometer', 'Odometer') || 'Unavailable',
-      energy: get('energy', 'energy_today_kwh', 'energy consumed', 'Energy consumed today') || 'Unavailable',
+      runningTime: formatRunningTimeLabel(get('running_time', 'today_running_minutes', 'time today', 'Running time today')),
+      avgSpeed: formatUnitValue(get('avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today'), 'km/h'),
+      temp: get('temperature', 'battery_temperature_c', 'Temperature') || 'Unavailable',
+      odometer: formatUnitValue(get('odometer', 'odometer_km', 'Odometer'), 'km'),
+      energy: formatUnitValue(get('energy', 'energy_today_kwh', 'energy consumed', 'Energy consumed today'), 'kWh'),
       eta: get('eta', 'Estimated Time of Arrival') || 'Unavailable',
       etaDate: get('eta_date', 'ETA date') || '06-05-2026',
-      lastUpdated: get('last_updated', 'Last updated', 'Vehicle updated timestamp') || 'Unavailable',
+      lastUpdated: get('last_updated', 'scraped_at', 'created_at', 'Last updated', 'Vehicle updated timestamp') || 'Unavailable',
       driverState: get('driver_state') || 'none',
       driver: get('driver', 'Active driver', 'Assigned driver', 'Last driver') || 'No driver confirmed yet',
       driverMeta: get('driver_meta') || 'Loaded from production source',
@@ -3403,6 +3403,24 @@ function parseCarbonKg(value) {
 function numberFromValue(value) {
   const match = String(value ?? '').replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
   return match ? Number(match[0]) : 0;
+}
+
+function formatUnitValue(value, unit, fallback = 'Unavailable') {
+  const text = String(value ?? '').trim();
+  if (!text || ['Unavailable', 'undefined', 'null', 'NaN'].includes(text)) return fallback;
+  if (/[a-z%]/i.test(text)) return text;
+  const number = numberFromValue(text);
+  return Number.isFinite(number) ? `${formatNumber(number)} ${unit}` : text;
+}
+
+function formatRunningTimeLabel(value) {
+  const text = String(value ?? '').trim();
+  if (!text || ['Unavailable', 'undefined', 'null', 'NaN'].includes(text)) return 'Unavailable';
+  const minutes = minutesFromRunningTime(text);
+  if (!minutes) return text;
+  const hours = Math.floor(minutes / 60);
+  const mins = Math.round(minutes % 60);
+  return hours ? `${hours}h ${mins}m` : `${mins}m`;
 }
 
 function parkingLocationsFor(clientHubs = [], parkings = []) {

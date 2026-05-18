@@ -202,7 +202,7 @@ async function getFleet(user) {
   const settings = settingsPayload?.settings || normalizeSettings();
   const rows = scopeRows(vehicles || [], user).map((vehicle, index) => (
     mergeVehicleOpsData(
-      normalizeVehicle(vehicle, index, latestSnapshots.get(vehicleKey(vehicle.id)), settings),
+      normalizeVehicle(vehicle, index, latestSnapshotForVehicle(vehicle, latestSnapshots), settings),
       latestDeployments.get(vehicleKey(vehicle.id)),
       latestAssignments.get(vehicleKey(vehicle.id)),
       index,
@@ -925,14 +925,33 @@ function latestByKey(rows, key, timeKey) {
 function latestSnapshotByVehicle(rows) {
   const latest = new Map();
   rows.forEach((row) => {
-    const id = vehicleKey(row.vehicle_number || row.vehicle || row.vehicle_id || row.id);
-    if (!id) return;
     const currentTime = new Date(row.scraped_at || row.created_at || 0).getTime() || 0;
-    const previous = latest.get(id);
-    const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() || 0 : -1;
-    if (currentTime >= previousTime) latest.set(id, row);
+    snapshotVehicleKeys(row).forEach((id) => {
+      const previous = latest.get(id);
+      const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() || 0 : -1;
+      if (currentTime >= previousTime) latest.set(id, row);
+    });
   });
   return latest;
+}
+
+function latestSnapshotForVehicle(row, snapshots) {
+  return snapshotVehicleKeys(row).map((key) => snapshots.get(key)).find(Boolean) || null;
+}
+
+function snapshotVehicleKeys(row = {}) {
+  const raw = objectValue(row.raw_payload) || objectValue(row.metadata) || {};
+  return [
+    row.vehicle_number,
+    row.vehicle,
+    row.id,
+    row.vehicle_id,
+    raw.Vehcile_no,
+    raw.vehicle_number,
+    raw.vehicle_no,
+    raw.vehicle_id,
+    raw.id,
+  ].map(vehicleKey).filter(Boolean);
 }
 
 function firstValue(...values) {
