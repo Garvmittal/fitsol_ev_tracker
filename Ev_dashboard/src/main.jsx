@@ -347,6 +347,7 @@ function App() {
   const driverContactByVehicle = useMemo(() => {
     const map = new Map();
     (driverAssignments || []).forEach((assignment) => {
+      if (!isCurrentDriverAssignment(assignment)) return;
       const vehicle = String(assignment.vehicle || '').trim().toUpperCase();
       if (!vehicle) return;
       map.set(vehicle, { name: assignment.name || '', email: assignment.email || '' });
@@ -619,6 +620,8 @@ function App() {
       layoverParkingGmpLink: String(form.get('layoverParkingGmpLink') || '').trim(),
       layoverParkingLat: Number(form.get('layoverParkingLat')),
       layoverParkingLng: Number(form.get('layoverParkingLng')),
+      driverEmail: String(form.get('driverEmail') || '').trim(),
+      driverName: String(form.get('driverName') || '').trim(),
     };
     const parkingCoords = Number.isFinite(deployment.parkingLat) && Number.isFinite(deployment.parkingLng)
       ? { lat: deployment.parkingLat, lng: deployment.parkingLng }
@@ -662,9 +665,20 @@ function App() {
           layoverParkingLng: deployment.layoverParkingLng,
           usage: form.get('usage'),
           poc: form.get('poc'),
+          driverEmail: deployment.driverEmail,
+          driverName: deployment.driverName,
         }),
       });
       if (payload.tasks?.length) setTasks((current) => [...payload.tasks, ...current]);
+      if (payload.assignment?.vehicle) {
+        setDriverAssignments((current) => [payload.assignment, ...current]);
+      }
+      const assignment = payload.assignment || null;
+      if (assignment?.name) {
+        deployment.driverState = assignment.sessionState === 'Active session' ? 'active' : 'assigned';
+        deployment.driver = assignment.name;
+        deployment.driverMeta = `${assignment.status || 'Assigned'} - ${assignment.shift || 'Deployment default'}`;
+      }
     } catch (error) {
       setToast(error.message || 'Unable to save deployment.');
       window.setTimeout(() => setToast(''), 2600);
@@ -722,6 +736,9 @@ function App() {
             parkingGmpLink: '',
             parkingLat: undefined,
             parkingLng: undefined,
+            driverState: 'none',
+            driver: 'No driver confirmed yet',
+            driverMeta: 'Driver session not connected',
             locationState: 'Not assigned to a hub/parking geofence',
             lastUpdated: 'just now',
           }
@@ -757,6 +774,9 @@ function App() {
             parkingGmpLink: '',
             parkingLat: undefined,
             parkingLng: undefined,
+            driverState: 'none',
+            driver: 'No driver confirmed yet',
+            driverMeta: 'Driver session not connected',
             locationState: 'Not assigned to a hub/parking geofence',
             lastUpdated: 'just now',
           }
@@ -1119,6 +1139,7 @@ function OperationsHub({
   const latestAssignmentByVehicle = useMemo(() => {
     const map = new Map();
     (assignments || []).forEach((row) => {
+      if (!isCurrentDriverAssignment(row)) return;
       const id = String(row.vehicle || '').trim().toUpperCase();
       if (!id) return;
       const t = new Date(row.createdAt || row.created_at || row.updatedAt || row.updated_at || row.shiftDate || 0).getTime() || 0;
@@ -1307,6 +1328,7 @@ function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeploy
   const selectedHub = hubs.find((h) => h.name === hub);
   const selectedParking = combinedParkings.find((p) => p.name === parking);
   const selectedTransient = combinedParkings.find((p) => p.name === transientParking);
+  const selectedDefaultDriver = driverOptions.find((d) => d.email === defaultDriverEmail);
   const layoverParking = deployedAlready && useTransientParking ? selectedTransient : selectedParking;
 
   async function handleSubmit(event) {
@@ -1324,6 +1346,8 @@ function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeploy
     event.currentTarget.querySelector('input[name=\"layoverParkingGmpLink\"]').value = layoverParking?.gmpLink || selectedParking?.gmpLink || '';
     event.currentTarget.querySelector('input[name=\"usage\"]').value = reason;
     event.currentTarget.querySelector('input[name=\"poc\"]').value = '';
+    event.currentTarget.querySelector('input[name=\"driverEmail\"]').value = defaultDriverEmail;
+    event.currentTarget.querySelector('input[name=\"driverName\"]').value = selectedDefaultDriver?.name || '';
 
     const ok = await addDeployment(event);
     if (ok) closeModal();
@@ -1406,7 +1430,7 @@ function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeploy
           </label>
           <button className="ghost-action compact-action" type="button" onClick={onOpenAddDriver}><Plus size={16} /> Add driver</button>
         </div>
-        <p className="form-note">Driver selection is recorded in ops notes for now; driver-to-vehicle mapping remains managed under Drivers.</p>
+        <p className="form-note">Selected driver becomes the current driver for this vehicle.</p>
 
         {/* hidden fields expected by addDeployment */}
         <input type="hidden" name="vehicle" defaultValue={vehicleId} />
@@ -1427,6 +1451,8 @@ function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeploy
         <input type="hidden" name="layoverParkingLng" defaultValue="" />
         <input type="hidden" name="usage" defaultValue="" />
         <input type="hidden" name="poc" defaultValue="" />
+        <input type="hidden" name="driverEmail" defaultValue="" />
+        <input type="hidden" name="driverName" defaultValue="" />
 
         <div className="modal-actions">
           <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
@@ -1522,7 +1548,7 @@ function AdminHub({ exportReport, range, rangeError, saveSettings, settingsState
 }
 
 function DriverConsole({ assignments, driverSession, setDriverSession }) {
-  const activeAssignment = assignments[0];
+  const activeAssignment = assignments.find(isCurrentDriverAssignment);
   const [sessionMessage, setSessionMessage] = useState('');
   async function toggleSession() {
     if (!activeAssignment?.assignmentId) return;
@@ -2600,6 +2626,7 @@ function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDri
   const currentVehicleByEmail = useMemo(() => {
     const latest = new Map();
     driverAssignments.forEach((assignment) => {
+      if (!isCurrentDriverAssignment(assignment)) return;
       const email = normalizeClientName(assignment.email);
       if (!email) return;
       const time = new Date(assignment.updatedAt || assignment.createdAt || 0).getTime();
@@ -3626,6 +3653,18 @@ function hasClientDeployment(vehicle) {
     vehicle?.hubGmpLink
     || vehicle?.parkingGmpLink
     || (safeValue(vehicle?.hub, '') && safeValue(vehicle?.hub, '') !== 'Unassigned hub' && safeValue(vehicle?.parking, '') !== 'Parking unavailable')
+  );
+}
+
+function isCurrentDriverAssignment(assignment) {
+  const status = String(assignment?.status || '').trim().toLowerCase();
+  const session = String(assignment?.sessionState || assignment?.session_state || '').trim().toLowerCase();
+  return !(
+    status.includes('replaced')
+    || status.includes('ended')
+    || status.includes('removed')
+    || status.includes('unassigned')
+    || session.includes('ended')
   );
 }
 

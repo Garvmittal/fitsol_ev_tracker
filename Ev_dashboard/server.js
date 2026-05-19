@@ -318,6 +318,8 @@ app.post('/api/deployments', requirePermission('deployments'), async (request, r
     const layoverParkingGmpLink = String(request.body?.layoverParkingGmpLink || '').trim();
     const usage = String(request.body?.usage || '').trim();
     const poc = String(request.body?.poc || '').trim();
+    const driverEmail = normalizeEmail(request.body?.driverEmail);
+    const driverName = String(request.body?.driverName || '').trim();
     const hubCoords = coordsFromBody(request.body, 'hub') || extractMapCoords(hubGmpLink);
     const parkingCoords = coordsFromBody(request.body, 'parking') || extractMapCoords(parkingGmpLink);
     const layoverCoords = coordsFromBody(request.body, 'layoverParking') || extractMapCoords(layoverParkingGmpLink);
@@ -363,6 +365,18 @@ app.post('/api/deployments', requirePermission('deployments'), async (request, r
       created_at: new Date().toISOString(),
     };
     await appendRecord(sheets, deploymentsSheetName, deploymentHeaders(), deployment);
+    const assignment = driverEmail
+      ? await createDeploymentDriverAssignment(sheets, {
+          vehicle,
+          client,
+          hub,
+          deployAt,
+          driverEmail,
+          driverName,
+          createdBy: request.user.email || request.user.name,
+          createdAt: deployment.created_at,
+        })
+      : null;
     const tasks = await createDeploymentTasks(sheets, {
       vehicle,
       client,
@@ -375,7 +389,7 @@ app.post('/api/deployments', requirePermission('deployments'), async (request, r
       poc,
       createdBy: request.user.email || request.user.name,
     });
-    response.json({ ok: true, deployment: normalizeDeploymentRow(deployment), tasks });
+    response.json({ ok: true, deployment: normalizeDeploymentRow(deployment), assignment, tasks });
   } catch (error) {
     response.status(500).json({ error: 'Unable to save deployment', message: error.message });
   }
@@ -413,6 +427,7 @@ app.post('/api/deployments/remove', requirePermission('deployments'), async (req
       },
       (row) => canAccessClient(request.user, row.client),
     );
+    await replaceCurrentDriverAssignments(sheets, { vehicle, createdBy: request.user.email || request.user.name });
 
     response.json({ ok: true, deployment: normalizeDeploymentRow(updated), removedAt });
   } catch (error) {
@@ -516,6 +531,11 @@ app.post('/api/driver-assignments', requirePermission('drivers'), async (request
     }
     const sheets = await getSheetsClient();
     await ensureSheetWithHeaders(sheets, driverAssignmentsSheetName, driverAssignmentHeaders());
+    await replaceCurrentDriverAssignments(sheets, {
+      vehicle: assignment.vehicle,
+      email: assignment.email,
+      createdBy: request.user.email || request.user.name,
+    });
     await appendRecord(sheets, driverAssignmentsSheetName, driverAssignmentHeaders(), assignment);
     response.json({ ok: true, assignment: normalizeDriverAssignmentRow(assignment) });
   } catch (error) {
@@ -1479,6 +1499,61 @@ async function createOpsTask(sheets, taskInput) {
   return normalizeTaskRow(task);
 }
 
+async function createDeploymentDriverAssignment(sheets, { vehicle, client, hub, deployAt, driverEmail, driverName, createdBy, createdAt }) {
+  await ensureSheetWithHeaders(sheets, driverAssignmentsSheetName, driverAssignmentHeaders());
+  await replaceCurrentDriverAssignments(sheets, { vehicle, email: driverEmail, createdBy });
+  const assignment = {
+    assignment_id: crypto.randomUUID(),
+    name: driverName || await driverNameForEmail(sheets, driverEmail),
+    email: driverEmail,
+    vehicle,
+    client,
+    hub,
+    shift_date: dateOnly(deployAt || createdAt),
+    shift: 'Deployment default',
+    status: 'Assigned',
+    session_state: 'Ready',
+    created_by: createdBy,
+    created_at: createdAt || new Date().toISOString(),
+    updated_at: '',
+  };
+  await appendRecord(sheets, driverAssignmentsSheetName, driverAssignmentHeaders(), assignment);
+  return normalizeDriverAssignmentRow(assignment);
+}
+
+async function replaceCurrentDriverAssignments(sheets, { vehicle, email, createdBy }) {
+  await ensureSheetWithHeaders(sheets, driverAssignmentsSheetName, driverAssignmentHeaders());
+  const rows = await getSheetRecords(sheets, driverAssignmentsSheetName);
+  const vehicleId = String(vehicle || '').trim().toUpperCase();
+  const driverEmail = normalizeEmail(email);
+  const timestamp = new Date().toISOString();
+  const targets = rows.filter((row) => {
+    const sameVehicle = vehicleId && String(row.vehicle || '').trim().toUpperCase() === vehicleId;
+    const sameDriver = driverEmail && normalizeEmail(row.email) === driverEmail;
+    return (sameVehicle || sameDriver) && isCurrentDriverAssignmentRow(row) && row.assignment_id;
+  });
+  await Promise.all(targets.map((row) => updateSheetRowById(
+    sheets,
+    driverAssignmentsSheetName,
+    'assignment_id',
+    row.assignment_id,
+    {
+      status: 'Replaced',
+      session_state: 'Ended session',
+      updated_at: timestamp,
+      created_by: row.created_by || createdBy || '',
+    },
+  )));
+}
+
+async function driverNameForEmail(sheets, email) {
+  if (!email) return '';
+  await ensureSheetWithHeaders(sheets, driversSheetName, driverHeaders());
+  const rows = await getSheetRecords(sheets, driversSheetName);
+  const match = rows.find((row) => normalizeEmail(row.email) === email);
+  return match?.name || '';
+}
+
 async function getLatestDeploymentsByVehicle(sheets) {
   await ensureSheetWithHeaders(sheets, deploymentsSheetName, deploymentHeaders());
   const rows = await getSheetRecords(sheets, deploymentsSheetName);
@@ -1488,7 +1563,7 @@ async function getLatestDeploymentsByVehicle(sheets) {
 async function getLatestAssignmentsByVehicle(sheets) {
   await ensureSheetWithHeaders(sheets, driverAssignmentsSheetName, driverAssignmentHeaders());
   const rows = await getSheetRecords(sheets, driverAssignmentsSheetName);
-  return latestByKey(rows, 'vehicle', 'created_at');
+  return latestByKey(rows.filter(isCurrentDriverAssignmentRow), 'vehicle', 'created_at');
 }
 
 function latestByKey(rows, key, timeKey) {
@@ -2146,6 +2221,25 @@ function simplifyPlaceLabel(address) {
 
 function normalizeBoolean(value) {
   return !['false', 'no', '0', 'inactive', 'removed', 'archived'].includes(String(value).trim().toLowerCase());
+}
+
+function isCurrentDriverAssignmentRow(row) {
+  const status = String(row?.status || '').trim().toLowerCase();
+  const session = String(row?.session_state || row?.sessionState || '').trim().toLowerCase();
+  return !(
+    status.includes('replaced')
+    || status.includes('ended')
+    || status.includes('removed')
+    || status.includes('unassigned')
+    || session.includes('ended')
+  );
+}
+
+function dateOnly(value) {
+  if (!value) return '';
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return String(value).slice(0, 10);
+  return new Date(time).toISOString().slice(0, 10);
 }
 
 function permissionsForRole(role) {

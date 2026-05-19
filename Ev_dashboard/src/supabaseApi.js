@@ -198,7 +198,7 @@ async function getFleet(user) {
   ]);
   if (error) throw error;
   const latestDeployments = latestByKey((deployments || []).filter((row) => row.status !== 'Removed'), 'vehicle', 'created_at');
-  const latestAssignments = latestByKey(assignments || [], 'vehicle', 'created_at');
+  const latestAssignments = latestByKey((assignments || []).filter(isCurrentDriverAssignmentRow), 'vehicle', 'created_at');
   const latestSnapshots = latestSnapshotByVehicle(snapshots || []);
   const settings = settingsPayload?.settings || normalizeSettings();
   const fleetRows = mergeVehicleRowsWithSnapshots(vehicles || [], latestSnapshots);
@@ -362,9 +362,13 @@ async function createParkingSite(body, user) {
 
 async function createDeployment(body, user) {
   requirePermission(user, 'deployments');
+  const vehicle = vehicleKey(body.vehicle);
+  const driverEmail = normalizeEmail(body.driverEmail);
+  const driverName = String(body.driverName || '').trim();
+  const createdAt = new Date().toISOString();
   const deployment = {
     deployment_id: cryptoRandomId(),
-    vehicle: body.vehicle || '',
+    vehicle,
     client: body.client || '',
     hub: body.hub || '',
     hub_gmp_link: body.hubGmpLink || '',
@@ -384,12 +388,24 @@ async function createDeployment(body, user) {
     poc: body.poc || '',
     status: 'Active',
     created_by: user.email,
-    created_at: new Date().toISOString(),
+    created_at: createdAt,
   };
   const { error } = await supabase.from('deployments').insert(deployment);
   if (error) throw error;
+  const assignment = driverEmail
+    ? await createDeploymentDriverAssignment({
+        vehicle,
+        client: deployment.client,
+        hub: deployment.hub,
+        deployAt: deployment.deploy_at,
+        driverEmail,
+        driverName,
+        user,
+        createdAt,
+      })
+    : null;
   const tasks = await createDeploymentTasks(deployment, user);
-  return { ok: true, deployment: normalizeDeployment(deployment), tasks };
+  return { ok: true, deployment: normalizeDeployment(deployment), assignment, tasks };
 }
 
 async function removeDeployment(body, user) {
@@ -407,6 +423,7 @@ async function removeDeployment(body, user) {
     .eq('vehicle', vehicle)
     .eq('status', 'Active');
   if (error) throw error;
+  await replaceActiveDriverAssignments({ vehicle, user });
   return { ok: true };
 }
 
@@ -434,11 +451,14 @@ async function getDriverAssignments(user) {
 
 async function createDriverAssignment(body, user) {
   requirePermission(user, 'drivers');
+  const vehicle = vehicleKey(body.vehicle);
+  const email = normalizeEmail(body.email);
+  await replaceActiveDriverAssignments({ vehicle, email, user });
   const row = {
     assignment_id: cryptoRandomId(),
     name: body.name || '',
-    email: normalizeEmail(body.email),
-    vehicle: body.vehicle || '',
+    email,
+    vehicle,
     client: body.client || '',
     hub: body.hub || '',
     shift_date: body.date || body.shiftDate || null,
@@ -451,6 +471,67 @@ async function createDriverAssignment(body, user) {
   const { error } = await supabase.from('driver_assignments').insert(row);
   if (error) throw error;
   return { assignment: normalizeDriverAssignment(row) };
+}
+
+async function createDeploymentDriverAssignment({ vehicle, client, hub, deployAt, driverEmail, driverName, user, createdAt }) {
+  const name = driverName || await driverNameForEmail(driverEmail);
+  await replaceActiveDriverAssignments({ vehicle, email: driverEmail, user });
+  const shiftDate = dateOnly(deployAt || createdAt);
+  const row = {
+    assignment_id: cryptoRandomId(),
+    name,
+    email: driverEmail,
+    vehicle,
+    client,
+    hub,
+    shift_date: shiftDate || null,
+    shift: 'Deployment default',
+    status: 'Assigned',
+    session_state: 'Ready',
+    created_by: user.email,
+    created_at: createdAt,
+  };
+  const { error } = await supabase.from('driver_assignments').insert(row);
+  if (error) throw error;
+  return normalizeDriverAssignment(row);
+}
+
+async function replaceActiveDriverAssignments({ vehicle, email, user }) {
+  const patch = {
+    status: 'Replaced',
+    session_state: 'Ended session',
+    updated_at: new Date().toISOString(),
+  };
+  const statuses = ['Assigned', 'Active', 'Started'];
+  const updates = [];
+  if (vehicle) {
+    updates.push(supabase
+      .from('driver_assignments')
+      .update(patch)
+      .eq('vehicle', vehicle)
+      .in('status', statuses));
+  }
+  if (email) {
+    updates.push(supabase
+      .from('driver_assignments')
+      .update(patch)
+      .eq('email', email)
+      .in('status', statuses));
+  }
+  const results = await Promise.all(updates);
+  const error = results.find((result) => result.error)?.error;
+  if (error) throw error;
+}
+
+async function driverNameForEmail(email) {
+  if (!email) return '';
+  const { data, error } = await supabase
+    .from('drivers')
+    .select('name')
+    .eq('email', email)
+    .limit(1);
+  if (error) return '';
+  return data?.[0]?.name || '';
 }
 
 async function updateDriverSession(body, user) {
@@ -938,6 +1019,18 @@ function latestByKey(rows, key, timeKey) {
   return latest;
 }
 
+function isCurrentDriverAssignmentRow(row) {
+  const status = normalizeText(row?.status);
+  const session = normalizeText(row?.session_state || row?.sessionState);
+  return !(
+    status.includes('replaced')
+    || status.includes('ended')
+    || status.includes('removed')
+    || status.includes('unassigned')
+    || session.includes('ended')
+  );
+}
+
 function latestSnapshotByVehicle(rows) {
   const latest = new Map();
   const history = new Map();
@@ -1276,6 +1369,13 @@ function normalizeText(value) {
 
 function vehicleKey(value) {
   return String(value || '').trim().toUpperCase();
+}
+
+function dateOnly(value) {
+  if (!value) return '';
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return String(value).slice(0, 10);
+  return new Date(time).toISOString().slice(0, 10);
 }
 
 function cryptoRandomId() {
