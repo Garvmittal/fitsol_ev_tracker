@@ -192,7 +192,7 @@ async function getFleet(user) {
     supabase.from('vehicles').select('*').order('last_updated', { ascending: false }),
     listRows('deployments', 'created_at', false),
     listRows('driver_assignments', 'created_at', false),
-    listTodaySnapshots(),
+    listRecentSnapshots(),
     getSettings(),
   ]);
   if (error) throw error;
@@ -200,7 +200,8 @@ async function getFleet(user) {
   const latestAssignments = latestByKey(assignments || [], 'vehicle', 'created_at');
   const latestSnapshots = latestSnapshotByVehicle(snapshots || []);
   const settings = settingsPayload?.settings || normalizeSettings();
-  const rows = scopeRows(vehicles || [], user).map((vehicle, index) => (
+  const fleetRows = mergeVehicleRowsWithSnapshots(vehicles || [], latestSnapshots);
+  const rows = scopeRows(fleetRows, user).map((vehicle, index) => (
     mergeVehicleOpsData(
       normalizeVehicle(vehicle, index, latestSnapshotForVehicle(vehicle, latestSnapshots), settings),
       latestDeployments.get(vehicleKey(vehicle.id)),
@@ -209,6 +210,38 @@ async function getFleet(user) {
     )
   ));
   return { vehicles: rows, updatedAt: new Date().toISOString() };
+}
+
+function mergeVehicleRowsWithSnapshots(vehicles, latestSnapshots) {
+  const rows = [...vehicles];
+  const known = new Set(rows.flatMap((row) => snapshotVehicleKeys(row)));
+  latestSnapshots.forEach((snapshot) => {
+    const keys = snapshotVehicleKeys(snapshot);
+    if (!keys.length || keys.some((key) => known.has(key))) return;
+    rows.push(vehicleRowFromSnapshot(snapshot));
+    keys.forEach((key) => known.add(key));
+  });
+  return rows;
+}
+
+function vehicleRowFromSnapshot(snapshot) {
+  const raw = objectValue(snapshot.raw_payload) || {};
+  const id = firstText(snapshot.vehicle_number, raw.Vehcile_no, raw.vehicle_number, snapshot.vehicle_id, raw.vehicle_id);
+  return {
+    id,
+    model: snapshot.vehicle_model || raw['vehicle model/model'] || '',
+    source_system: snapshot.source || raw.source || '',
+    status: snapshot.movement_status_raw || raw['current status of vehicle'] || '',
+    battery: snapshot.battery_percent ?? raw['battery%'],
+    today_distance: snapshot.distance_today_km ?? raw['Dist._today'],
+    running_time: snapshot.today_running_minutes ?? raw['time today'],
+    avg_speed: snapshot.today_avg_speed_kmph ?? raw['average speed(calculated from distance and time)'],
+    odometer: snapshot.odometer_km ?? raw.odometer,
+    last_updated: snapshot.scraped_at || raw.scraped_at || '',
+    lat: snapshot.latitude ?? raw.lat,
+    lng: snapshot.longitude ?? raw.long ?? raw.lng,
+    metadata: raw,
+  };
 }
 
 async function getClientHubs(user) {
@@ -570,11 +603,11 @@ async function listRows(table, orderBy = '', ascending = true) {
   return data || [];
 }
 
-async function listTodaySnapshots() {
+async function listRecentSnapshots(days = 10) {
   const { data, error } = await supabase
     .from('vehicle_snapshots')
     .select('*')
-    .gte('scraped_at', todayStartIsoForIndia())
+    .gte('scraped_at', daysAgoStartIsoForIndia(days))
     .order('scraped_at', { ascending: false })
     .limit(10000);
   if (error) throw error;
@@ -633,19 +666,9 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     raw.avg_speed,
     row.avg_speed,
   ));
-  const energyValue = firstValue(
-    source.energy_today_kwh,
-    raw['energy consumed'],
-    raw.energy_today_kwh,
-    raw.energy,
-    row.energy_today_kwh,
-    row.energy,
-  );
-  const energyToday = numberFromTelemetry(energyValue);
-  const energy = formatWithUnit(energyValue, 'kWh', energyToday === 0 ? '0 kWh' : 'Unavailable');
   const lastStop = firstText(source.last_stop_location_text, raw['last stop'], raw.last_stop_location_text, raw.last_stop, row.last_stop, row.last_stop_location_text, coordinateLabel(lat, lng), 'No stop recorded today');
   const lastUpdated = firstText(source.scraped_at, row.last_updated, row.updated_at, row.created_at, '');
-  const carbonSaved = carbonSavedVsCng(todayDistance, energyToday, settings);
+  const carbonSaved = carbonSavedVsCng(todayDistance, null, settings);
   const model = firstText(source.vehicle_model, raw['vehicle model/model'], row.model, row.source_system, 'Model pending');
   const sourceSystem = firstText(source.source, raw.source, row.source_system, 'Source pending');
 
@@ -664,7 +687,6 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     avgSpeed,
     temp: firstText(row.temp, raw.battery_temperature_c, 'Not recorded'),
     odometer: firstText(source.odometer_km, raw.odometer, row.odometer, 'Not recorded'),
-    energy,
     eta: row.eta || 'Unavailable',
     etaDate: row.eta_date || '',
     lastUpdated,
@@ -675,16 +697,8 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     location: firstText(row.location, row.location_text, lastStop, coordinateLabel(lat, lng), 'Location pending'),
     lastStop,
     carbon: `${carbonSaved.toFixed(1)} kgCO2e`,
-    confidence: energyToday === null
-      ? `Estimated from distance using ${settings.evEnergy} kWh/km fallback vs CNG`
-      : 'Estimated from distance and energy vs CNG',
-    trips: [{
-      title: 'Latest stop',
-      location: lastStop,
-      distanceTodayKm: todayDistance,
-      runningTime,
-      scrapedAt: lastUpdated,
-    }],
+    confidence: `Estimated from distance using ${settings.evEnergy} kWh/km fallback vs CNG`,
+    stops: stopHistoryForVehicle(row, latestSnapshot),
     lat,
     lng,
     x: 34 + (index % 8) * 6,
@@ -924,19 +938,54 @@ function latestByKey(rows, key, timeKey) {
 
 function latestSnapshotByVehicle(rows) {
   const latest = new Map();
+  const history = new Map();
   rows.forEach((row) => {
     const currentTime = new Date(row.scraped_at || row.created_at || 0).getTime() || 0;
     snapshotVehicleKeys(row).forEach((id) => {
+      if (!history.has(id)) history.set(id, []);
+      history.get(id).push(row);
       const previous = latest.get(id);
       const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() || 0 : -1;
       if (currentTime >= previousTime) latest.set(id, row);
     });
+  });
+  latest.forEach((row, id) => {
+    const sortedHistory = [...(history.get(id) || [])].sort((a, b) => (
+      new Date(b.scraped_at || b.created_at || 0).getTime() - new Date(a.scraped_at || a.created_at || 0).getTime()
+    ));
+    if (!row.__history || sortedHistory.length > row.__history.length) row.__history = sortedHistory;
   });
   return latest;
 }
 
 function latestSnapshotForVehicle(row, snapshots) {
   return snapshotVehicleKeys(row).map((key) => snapshots.get(key)).find(Boolean) || null;
+}
+
+function stopHistoryForVehicle(row, latestSnapshot = null) {
+  const snapshots = latestSnapshot?.__history || (latestSnapshot ? [latestSnapshot] : []);
+  const seen = new Set();
+  return snapshots
+    .map((snapshot) => {
+      const raw = objectValue(snapshot.raw_payload) || {};
+      const lat = toNumberOrUndefined(firstValue(snapshot.latitude, raw.lat));
+      const lng = toNumberOrUndefined(firstValue(snapshot.longitude, raw.long, raw.lng));
+      const location = firstText(snapshot.last_stop_location_text, raw['last stop'], coordinateLabel(lat, lng));
+      const scrapedAt = firstText(snapshot.scraped_at, raw.scraped_at);
+      const key = `${dateKey(scrapedAt)}:${location}`;
+      if (!location || seen.has(key)) return null;
+      seen.add(key);
+      const minutes = minutesFromTelemetry(firstValue(snapshot.today_running_minutes, raw['time today']));
+      return {
+        location,
+        scrapedAt,
+        distanceTodayKm: numberFromTelemetry(firstValue(snapshot.distance_today_km, raw['Dist._today'])) ?? 0,
+        runningTime: minutesLabel(minutes) || '0h 0m',
+        status: normalizeStatus(firstValue(snapshot.movement_status_raw, raw['current status of vehicle'])),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 10);
 }
 
 function snapshotVehicleKeys(row = {}) {
@@ -1135,7 +1184,7 @@ function formatWithUnit(value, unit, fallback = 'Unavailable') {
   return number === null ? text : `${number} ${unit}`;
 }
 
-function todayStartIsoForIndia() {
+function daysAgoStartIsoForIndia(days = 0) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
     year: 'numeric',
@@ -1143,7 +1192,9 @@ function todayStartIsoForIndia() {
     day: '2-digit',
   }).formatToParts(new Date());
   const part = (type) => parts.find((item) => item.type === type)?.value;
-  return new Date(`${part('year')}-${part('month')}-${part('day')}T00:00:00+05:30`).toISOString();
+  const date = new Date(`${part('year')}-${part('month')}-${part('day')}T00:00:00+05:30`);
+  date.setDate(date.getDate() - days);
+  return date.toISOString();
 }
 
 function previousDateKey() {

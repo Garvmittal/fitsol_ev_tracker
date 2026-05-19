@@ -1804,7 +1804,7 @@ function FilterSection({ title, field, options, selected, toggleItem }) {
 }
 
 function VehicleCard({ vehicle, driverContact, selected, onClick }) {
-  const lastUpdatedLabel = formatRelativeTimestamp(vehicle.lastUpdated);
+  const lastUpdatedLabel = formatIndiaTimestamp(vehicle.lastUpdated) || formatRelativeTimestamp(vehicle.lastUpdated);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   return (
     <button className={selected ? 'vehicle-card selected' : 'vehicle-card'} type="button" onClick={onClick}>
@@ -1838,7 +1838,6 @@ function VehicleCard({ vehicle, driverContact, selected, onClick }) {
       <div className="insight-grid">
         <Info label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} strong />
         <Info label="Average speed" value={safeValue(avgSpeedLabel)} />
-        <Info label="Energy today" value={safeValue(vehicle.energy)} />
         <Info label="Last stop" value={safeValue(vehicle.lastStop, 'No stop recorded today')} />
         <Info label="Source" value={safeValue(vehicle.sourceSystem, 'Telemetry source pending')} />
       </div>
@@ -2261,16 +2260,16 @@ function distanceMeters(a, b) {
 }
 
 function VehicleDetail({ vehicle, parkings = [], driverContact }) {
-  const lastUpdatedLabel = formatRelativeTimestamp(vehicle.lastUpdated);
+  const lastUpdatedLabel = formatIndiaTimestamp(vehicle.lastUpdated) || formatRelativeTimestamp(vehicle.lastUpdated);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   const placeLabel = useNearPlaceLabel(vehicle?.lat, vehicle?.lng);
-  const trip = vehicle.trips?.[0] || {
-    title: 'Latest stop',
+  const stops = vehicle.stops?.length ? vehicle.stops : [{
     location: vehicle.lastStop,
     distanceTodayKm: vehicle.todayDistance,
     runningTime: vehicle.runningTime,
     scrapedAt: vehicle.lastUpdated,
-  };
+    status: vehicle.status,
+  }];
   return (
     <section className="detail-panel">
       <div className="detail-heading">
@@ -2285,7 +2284,6 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
         <MetricMini icon={Route} label="Distance today" value={`${vehicle.todayDistance} km`} />
         <MetricMini icon={Gauge} label="Running time" value={safeValue(vehicle.runningTime)} />
         <MetricMini icon={Car} label="Odometer" value={formatOdometer(vehicle.odometer)} />
-        <MetricMini icon={Zap} label="Energy today" value={safeValue(vehicle.energy)} />
         <MetricMini icon={Zap} label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} />
       </div>
       <div className="detail-tabs">
@@ -2310,15 +2308,17 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
           <p>Place status: {vehicle.locationState || 'Not assigned to a hub/parking geofence'}</p>
           {vehicle.hubGmpLink && <p><ActionLink href={vehicle.hubGmpLink} icon={MapPin} label="Open hub map" /></p>}
           {vehicle.parkingGmpLink && <p><ActionLink href={vehicle.parkingGmpLink} icon={ParkingCircle} label="Open parking map" /></p>}
-          <p>Energy today: {safeValue(vehicle.energy)}</p>
           <p>Carbon basis: {safeValue(vehicle.confidence, 'Estimated vs CNG')}</p>
         </div>
         <div>
-          <h3>Trips</h3>
-          <p>{safeValue(trip.title, 'Latest stop')}: {safeValue(trip.location, 'No stop recorded today')}</p>
-          <p>Distance today: {formatNumber(trip.distanceTodayKm)} km</p>
-          <p>Running time: {safeValue(trip.runningTime, '0h 0m')}</p>
-          <p>Scraped: {safeValue(formatRelativeTimestamp(trip.scrapedAt), lastUpdatedLabel)}</p>
+          <h3>Stops</h3>
+          {stops.slice(0, 10).map((stop, index) => (
+            <div className="stop-history-item" key={`${stop.scrapedAt || index}-${stop.location}`}>
+              <p>{safeValue(stop.location, 'No stop recorded')}</p>
+              <span>{safeValue(formatIndiaTimestamp(stop.scrapedAt), 'Time unavailable')} · {safeValue(stop.status, 'Status unavailable')}</span>
+              <span>{formatNumber(stop.distanceTodayKm)} km · {safeValue(stop.runningTime, '0h 0m')}</span>
+            </div>
+          ))}
         </div>
       </div>
     </section>
@@ -3321,10 +3321,15 @@ async function loadProductionVehicles() {
 
 function normalizeVehicleRows(rows) {
   return rows.map((row, index) => {
+    const rawPayload = objectValue(row.raw_payload);
+    const metadata = objectValue(row.metadata);
+    const sources = [rawPayload, metadata, row].filter(Boolean);
     const get = (...keys) => {
       for (const key of keys) {
-        const value = row[key] ?? row[toSnake(key)] ?? row[toTitle(key)] ?? row[key.toLowerCase()];
-        if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+        for (const source of sources) {
+          const value = source[key] ?? source[toSnake(key)] ?? source[toTitle(key)] ?? source[key.toLowerCase()];
+          if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+        }
       }
       return '';
     };
@@ -3358,6 +3363,7 @@ function normalizeVehicleRows(rows) {
       lastStop: get('last_stop', 'last_stop_location_text', 'last stop', 'Last stop text address') || 'Last stop unavailable',
       carbon: get('carbon', 'Carbon saved vs CNG') || 'Unavailable',
       confidence: get('carbon_confidence', 'Carbon confidence') || 'Unavailable',
+      stops: Array.isArray(row.stops) ? row.stops : stopHistoryFromRawRow(row, rawPayload || metadata),
       hubGmpLink: get('hub_gmp_link', 'Hub GMP Link', 'Hub Google Maps link') || '',
       hubLat: Number(get('hub_lat', 'Hub Lat')) || undefined,
       hubLng: Number(get('hub_lng', 'Hub Lng')) || undefined,
@@ -3405,6 +3411,30 @@ function numberFromValue(value) {
   return match ? Number(match[0]) : 0;
 }
 
+function objectValue(value) {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function stopHistoryFromRawRow(row = {}, raw = {}) {
+  const location = row.last_stop_location_text || row.last_stop || raw?.['last stop'] || raw?.last_stop_location_text || '';
+  if (!location) return [];
+  return [{
+    location,
+    scrapedAt: row.scraped_at || raw?.scraped_at || row.last_updated || '',
+    distanceTodayKm: numberFromValue(row.distance_today_km ?? raw?.['Dist._today'] ?? row.today_distance),
+    runningTime: formatRunningTimeLabel(row.today_running_minutes ?? raw?.['time today'] ?? row.running_time),
+    status: normalizeStatus(row.movement_status_raw || raw?.['current status of vehicle'] || row.status),
+  }];
+}
+
 function formatUnitValue(value, unit, fallback = 'Unavailable') {
   const text = String(value ?? '').trim();
   if (!text || ['Unavailable', 'undefined', 'null', 'NaN'].includes(text)) return fallback;
@@ -3421,6 +3451,24 @@ function formatRunningTimeLabel(value) {
   const hours = Math.floor(minutes / 60);
   const mins = Math.round(minutes % 60);
   return hours ? `${hours}h ${mins}m` : `${mins}m`;
+}
+
+function formatIndiaTimestamp(value) {
+  const text = String(value || '').trim();
+  if (!text || /^unavailable$/i.test(text)) return '';
+  const normalized = text.includes(' ') && /[+-]\d\d$/.test(text)
+    ? text.replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')
+    : text;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
 }
 
 function parkingLocationsFor(clientHubs = [], parkings = []) {

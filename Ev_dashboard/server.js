@@ -897,7 +897,7 @@ function normalizeFleetRecords(records, settings = defaultSettings()) {
       const odometer = field(record, 'odometer_km', 'odometer');
       const locationText = field(record, 'location_text', 'location', 'last_location');
       const lastUpdated = field(record, 'vehicle_updated_at', 'last_updated', 'updated_at', 'scraped_at');
-      const carbonSaved = carbonSavedVsCng(todayDistance, energyToday, settings);
+      const carbonSaved = carbonSavedVsCng(todayDistance, null, settings);
       return {
         id: vehicleNumber,
         model: field(record, 'vehicle_model', 'vehicle model/model', 'model', 'make_model') || 'Unspecified model',
@@ -924,7 +924,8 @@ function normalizeFleetRecords(records, settings = defaultSettings()) {
         location: locationText || coordinateLabel(lat, lng) || 'Location unavailable',
         lastStop: field(record, 'last_stop_location_text', 'last stop', 'last_stop') || 'Last stop unavailable',
         carbon: carbonSaved === null ? 'Unavailable' : `${carbonSaved.toFixed(1)} kgCO2e`,
-        confidence: carbonSaved === null ? 'Unavailable' : 'Estimated vs CNG',
+        confidence: carbonSaved === null ? 'Unavailable' : `Estimated from distance using ${settings.evEnergy} kWh/km fallback vs CNG`,
+        stops: stopHistoryForRecord(record),
         lat,
         lng,
       };
@@ -933,7 +934,7 @@ function normalizeFleetRecords(records, settings = defaultSettings()) {
 }
 
 function field(record, ...keys) {
-  const sources = [record, objectValue(record?.metadata), objectValue(record?.raw_payload)].filter(Boolean);
+  const sources = [objectValue(record?.raw_payload), objectValue(record?.metadata), record].filter(Boolean);
   for (const source of sources) {
     for (const key of keys) {
       const value = source[key];
@@ -1010,42 +1011,59 @@ async function getFleetData(sheets) {
 }
 
 async function mergeLatestSnapshotsIntoRecords(sheets, records) {
-  const snapshots = await getTodaySnapshotRecords(sheets);
+  const snapshots = await getRecentSnapshotRecords(sheets);
   if (!snapshots.length) return records;
   const latestSnapshots = latestSnapshotsByVehicle(snapshots);
-  return records.map((record) => {
+  const merged = records.map((record) => {
     const snapshot = latestSnapshotForRecord(record, latestSnapshots);
     return snapshot ? mergeFleetRecordWithSnapshot(record, snapshot) : record;
   });
+  const known = new Set(merged.flatMap((record) => snapshotVehicleKeys(record)));
+  latestSnapshots.forEach((snapshot) => {
+    const keys = snapshotVehicleKeys(snapshot);
+    if (!keys.length || keys.some((key) => known.has(key))) return;
+    merged.push(mergeFleetRecordWithSnapshot(snapshotVehicleRecord(snapshot), snapshot));
+    keys.forEach((key) => known.add(key));
+  });
+  return merged;
 }
 
-async function getTodaySnapshotRecords(sheets) {
+async function getRecentSnapshotRecords(sheets, days = 10) {
   const db = (sheets && sheets.supabase) || supabaseModule.getClient();
   try {
     const { data, error } = await db
       .from('vehicle_snapshots')
       .select('*')
-      .gte('scraped_at', todayStartIsoForIndia())
+      .gte('scraped_at', daysAgoStartIsoForIndia(days))
       .order('scraped_at', { ascending: false })
       .limit(10000);
     if (error) throw error;
     return data || [];
   } catch (error) {
-    console.error('Unable to load today vehicle snapshots:', error.message || error);
+    console.error('Unable to load recent vehicle snapshots:', error.message || error);
     return [];
   }
 }
 
 function latestSnapshotsByVehicle(rows) {
   const latest = new Map();
+  const history = new Map();
   for (const row of rows || []) {
     const currentTime = new Date(row.scraped_at || row.created_at || 0).getTime() || 0;
     for (const key of snapshotVehicleKeys(row)) {
+      if (!history.has(key)) history.set(key, []);
+      history.get(key).push(row);
       const previous = latest.get(key);
       const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() || 0 : -1;
       if (currentTime >= previousTime) latest.set(key, row);
     }
   }
+  latest.forEach((row, key) => {
+    const sortedHistory = [...(history.get(key) || [])].sort((a, b) => (
+      new Date(b.scraped_at || b.created_at || 0).getTime() - new Date(a.scraped_at || a.created_at || 0).getTime()
+    ));
+    if (!row.__history || sortedHistory.length > row.__history.length) row.__history = sortedHistory;
+  });
   return latest;
 }
 
@@ -1089,11 +1107,57 @@ function mergeFleetRecordWithSnapshot(record, snapshot) {
     last_stop_location_text: snapshot.last_stop_location_text,
     scraped_at: snapshot.scraped_at,
     raw_payload: rawPayload,
+    __history: snapshot.__history || [snapshot],
     metadata: {
       ...(objectValue(record.metadata) || {}),
       ...rawPayload,
     },
   };
+}
+
+function snapshotVehicleRecord(snapshot) {
+  const raw = objectValue(snapshot.raw_payload) || {};
+  return {
+    id: snapshot.vehicle_number || raw.Vehcile_no || raw.vehicle_number || snapshot.vehicle_id || raw.vehicle_id,
+    model: snapshot.vehicle_model || raw['vehicle model/model'] || '',
+    source_system: snapshot.source || raw.source || '',
+    status: snapshot.movement_status_raw || raw['current status of vehicle'] || '',
+    battery: snapshot.battery_percent ?? raw['battery%'],
+    today_distance: snapshot.distance_today_km ?? raw['Dist._today'],
+    running_time: snapshot.today_running_minutes ?? raw['time today'],
+    avg_speed: snapshot.today_avg_speed_kmph ?? raw['average speed(calculated from distance and time)'],
+    odometer: snapshot.odometer_km ?? raw.odometer,
+    last_updated: snapshot.scraped_at || raw.scraped_at || '',
+    lat: snapshot.latitude ?? raw.lat,
+    lng: snapshot.longitude ?? raw.long ?? raw.lng,
+    metadata: raw,
+  };
+}
+
+function stopHistoryForRecord(record) {
+  const snapshots = Array.isArray(record.__history) ? record.__history : [];
+  const seen = new Set();
+  return snapshots
+    .map((snapshot) => {
+      const raw = objectValue(snapshot.raw_payload) || {};
+      const lat = optionalNumber(snapshot, 'latitude', 'lat') ?? optionalNumber(raw, 'lat');
+      const lng = optionalNumber(snapshot, 'longitude', 'lng', 'long', 'lon') ?? optionalNumber(raw, 'long', 'lng', 'lon');
+      const location = field(snapshot, 'last_stop_location_text', 'last stop', 'last_stop') || coordinateLabel(lat, lng);
+      const scrapedAt = field(snapshot, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'created_at');
+      const key = `${dateKey(scrapedAt)}:${location}`;
+      if (!location || seen.has(key)) return null;
+      seen.add(key);
+      const runningMinutes = optionalNumber(snapshot, 'today_running_minutes', 'time today', 'running_minutes');
+      return {
+        location,
+        scrapedAt,
+        distanceTodayKm: optionalNumber(snapshot, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0,
+        runningTime: minutesLabel(runningMinutes),
+        status: normalizeStatus(field(snapshot, 'movement_status_raw', 'current status of vehicle', 'status')),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 10);
 }
 
 async function getAlertRecipients(sheets) {
@@ -2098,7 +2162,7 @@ function previousDateKey() {
   return dateKey(date);
 }
 
-function todayStartIsoForIndia() {
+function daysAgoStartIsoForIndia(days = 0) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
     year: 'numeric',
@@ -2106,7 +2170,9 @@ function todayStartIsoForIndia() {
     day: '2-digit',
   }).formatToParts(new Date());
   const part = (type) => parts.find((item) => item.type === type)?.value;
-  return new Date(`${part('year')}-${part('month')}-${part('day')}T00:00:00+05:30`).toISOString();
+  const date = new Date(`${part('year')}-${part('month')}-${part('day')}T00:00:00+05:30`);
+  date.setDate(date.getDate() - days);
+  return date.toISOString();
 }
 
 function dateKey(value) {

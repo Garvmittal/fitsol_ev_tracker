@@ -1199,6 +1199,23 @@ h1 {
   margin: 7px 0;
 }
 
+.stop-history-item {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 0 10px;
+}
+
+.stop-history-item:last-child {
+  border-bottom: 0;
+}
+
+.stop-history-item span {
+  color: #6b7280;
+  display: block;
+  font-size: 13px;
+  line-height: 1.35;
+  margin-top: 3px;
+}
+
 .action-link {
   align-items: center;
   background: #ffffff;
