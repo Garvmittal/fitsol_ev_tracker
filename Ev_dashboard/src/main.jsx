@@ -297,8 +297,6 @@ function App() {
     addParkingSite({ name, location: '', gmpLink });
   }
 
-  const selected = vehicles.find((vehicle) => vehicle.id === selectedId) || vehicles[0];
-
   useEffect(() => {
     if (auth.loading || !auth.user || !canAccess(auth.user, 'fleet')) return undefined;
     let cancelled = false;
@@ -395,6 +393,31 @@ function App() {
       return matchesQuery && matchesStatusGroup && matchesVehicleStatus && matchesModel && matchesClient;
     });
   }, [vehicles, query, statusFilter, fleetFilters]);
+
+  const mapFiltersActive = Boolean(
+    query.trim()
+    || statusFilter === 'Offline'
+    || fleetFilters.clients.length
+    || fleetFilters.models.length
+    || fleetFilters.statuses.length
+  );
+  const mapClientHubs = useMemo(() => {
+    if (!mapFiltersActive) return [];
+    const clientNames = new Set(
+      (fleetFilters.clients.length
+        ? fleetFilters.clients
+        : filteredVehicles.map((vehicle) => normalizeClientName(vehicle.client)))
+        .filter(Boolean),
+    );
+    return clientHubs.filter((client) => clientNames.has(normalizeClientName(client.client)));
+  }, [clientHubs, filteredVehicles, fleetFilters.clients, mapFiltersActive]);
+  const mapParkings = useMemo(() => {
+    if (!mapFiltersActive) return parkings;
+    const parkingNames = new Set(filteredVehicles.map((vehicle) => normalizeMapScopeName(vehicle.parking)).filter(Boolean));
+    if (!parkingNames.size) return [];
+    return parkings.filter((parking) => parkingNames.has(normalizeMapScopeName(parking.name)));
+  }, [parkings, filteredVehicles, mapFiltersActive]);
+  const selected = filteredVehicles.find((vehicle) => vehicle.id === selectedId) || filteredVehicles[0] || null;
 
   useEffect(() => {
     if (filteredVehicles.length && !filteredVehicles.some((vehicle) => vehicle.id === selectedId)) {
@@ -956,7 +979,8 @@ function App() {
 	            query={query}
 	            setQuery={setQuery}
 	            mapConfig={mapConfig}
-	            parkings={parkings}
+	            parkings={mapParkings}
+	            clientHubs={mapClientHubs}
 	            driverContactByVehicle={driverContactByVehicle}
 	          />
 	        )}
@@ -1675,7 +1699,7 @@ function CarbonTrendChart({ points }) {
   );
 }
 
-function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, activeVehicleCount, offlineVehicleCount, query, setQuery, mapConfig, parkings, driverContactByVehicle }) {
+function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, activeVehicleCount, offlineVehicleCount, query, setQuery, mapConfig, parkings, clientHubs, driverContactByVehicle }) {
   return (
     <>
       <Toolbar
@@ -1693,13 +1717,17 @@ function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, stat
       />
       <section className="fleet-layout">
         <aside className="vehicle-list">
-          {filteredVehicles.map((vehicle) => (
+          {filteredVehicles.length ? filteredVehicles.map((vehicle) => (
             <VehicleCard key={vehicle.id} selected={selectedId === vehicle.id} vehicle={vehicle} driverContact={driverContactByVehicle?.get(vehicle.id)} onClick={() => setSelectedId(vehicle.id)} />
-          ))}
+          )) : <div className="empty-state">No vehicles match the selected filters.</div>}
         </aside>
         <div className="map-column">
-          <FleetMap vehicles={filteredVehicles} selectedId={selectedId} setSelectedId={setSelectedId} mapConfig={mapConfig} parkings={parkings} />
-          <VehicleDetail vehicle={selected} parkings={parkings} driverContact={driverContactByVehicle?.get(selected?.id)} />
+          <FleetMap vehicles={filteredVehicles} selectedId={selectedId} setSelectedId={setSelectedId} mapConfig={mapConfig} parkings={parkings} clientHubs={clientHubs} />
+          {selected ? (
+            <VehicleDetail vehicle={selected} parkings={parkings} driverContact={driverContactByVehicle?.get(selected?.id)} />
+          ) : (
+            <section className="detail-panel empty-state">Select different filters to view vehicle details.</section>
+          )}
         </div>
       </section>
     </>
@@ -1859,13 +1887,13 @@ function Info({ label, value, strong, badge }) {
   );
 }
 
-function FleetMap({ vehicles, selectedId, setSelectedId, mapConfig, parkings = [] }) {
+function FleetMap({ vehicles, selectedId, setSelectedId, mapConfig, parkings = [], clientHubs = [] }) {
   const [activeMarkerId, setActiveMarkerId] = useState('');
-  const mapMarkers = buildMapMarkers(vehicles, selectedId, parkings);
+  const mapMarkers = buildMapMarkers(vehicles, selectedId, parkings, clientHubs);
   const activeMarker = mapMarkers.find((marker) => marker.id === activeMarkerId);
 
   if (mapConfig?.enabled) {
-    return <RealGoogleMap apiKey={mapConfig.apiKey} mapId={mapConfig.mapId} vehicles={vehicles} selectedId={selectedId} setSelectedId={setSelectedId} parkings={parkings} />;
+    return <RealGoogleMap apiKey={mapConfig.apiKey} mapId={mapConfig.mapId} vehicles={vehicles} selectedId={selectedId} setSelectedId={setSelectedId} parkings={parkings} clientHubs={clientHubs} />;
   }
 
   return (
@@ -1915,13 +1943,13 @@ function FleetMap({ vehicles, selectedId, setSelectedId, mapConfig, parkings = [
   );
 }
 
-function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, parkings = [] }) {
+function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, parkings = [], clientHubs = [] }) {
   const mapEl = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef([]);
   const [mapError, setMapError] = useState('');
   const [activeMarkerId, setActiveMarkerId] = useState('');
-  const mapMarkers = useMemo(() => buildMapMarkers(vehicles, selectedId, parkings), [vehicles, selectedId, parkings]);
+  const mapMarkers = useMemo(() => buildMapMarkers(vehicles, selectedId, parkings, clientHubs), [vehicles, selectedId, parkings, clientHubs]);
   const activeMarker = mapMarkers.find((marker) => marker.id === activeMarkerId);
 
   useEffect(() => {
@@ -2073,8 +2101,9 @@ function googleDotIcon(fill, selected = false, kind = 'vehicle') {
   };
 }
 
-function buildMapMarkers(vehicles, selectedId, globalParkings = []) {
+function buildMapMarkers(vehicles, selectedId, globalParkings = [], clientHubs = []) {
   const markers = [];
+  const hubKeys = new Set();
   vehicles.forEach((vehicle) => {
     const selected = vehicle.id === selectedId;
     markers.push({
@@ -2094,8 +2123,29 @@ function buildMapMarkers(vehicles, selectedId, globalParkings = []) {
         ['Parking', safeValue(vehicle.parking, 'Parking unavailable')],
       ],
     });
-    addLocationMarker(markers, vehicle, 'hub', selected);
+    addLocationMarker(markers, vehicle, 'hub', selected, hubKeys);
     addLocationMarker(markers, vehicle, 'parking', selected);
+  });
+  (clientHubs || []).forEach((client) => {
+    normalizeLocationRecords(client.hubs).forEach((hub, index) => {
+      const coords = coordsFromFields(hub.lat, hub.lng) || extractMapCoords(hub.gmpLink);
+      if (!coords) return;
+      const key = mapLocationKey(coords, hub.name);
+      if (hubKeys.has(key)) return;
+      hubKeys.add(key);
+      markers.push({
+        id: `client-hub-${normalizeClientName(client.client)}-${index}-${normalizeMapScopeName(hub.name)}`,
+        kind: 'hub',
+        coords,
+        selected: false,
+        title: `Hub: ${hub.name}`,
+        details: [
+          ['Hub', hub.name],
+          ['Client', safeValue(client.client, 'Unassigned client')],
+          ['Map', hub.gmpLink || ''],
+        ],
+      });
+    });
   });
   // add standalone global parking site markers
   (globalParkings || []).forEach((p) => {
@@ -2115,10 +2165,12 @@ function buildMapMarkers(vehicles, selectedId, globalParkings = []) {
   return markers;
 }
 
-function addLocationMarker(markers, vehicle, kind, selected) {
+function addLocationMarker(markers, vehicle, kind, selected, locationKeys = null) {
   const coords = kind === 'hub' ? hubCoordsFor(vehicle) : parkingCoordsFor(vehicle);
   if (!coords) return;
   const name = kind === 'hub' ? safeValue(vehicle.hub, 'Mapped hub') : safeValue(vehicle.parking, 'Mapped parking');
+  const key = mapLocationKey(coords, name);
+  if (locationKeys) locationKeys.add(key);
   markers.push({
     id: `${kind}-${vehicle.id}`,
     kind,
@@ -2152,6 +2204,13 @@ function hubCoordsFor(vehicle) {
 
 function parkingCoordsFor(vehicle) {
   return coordsFromFields(vehicle?.parkingLat, vehicle?.parkingLng) || extractMapCoords(vehicle?.parkingGmpLink);
+}
+
+function mapLocationKey(coords, name = '') {
+  const lat = Number(coords?.lat);
+  const lng = Number(coords?.lng);
+  const coordKey = Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(5)},${lng.toFixed(5)}` : '';
+  return `${coordKey}:${normalizeMapScopeName(name)}`;
 }
 
 function fallbackPointFor(vehicle) {
@@ -3584,6 +3643,10 @@ function deploymentStatusLabel(vehicle) {
 }
 
 function normalizeClientName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeMapScopeName(value) {
   return String(value || '').trim().toLowerCase();
 }
 
