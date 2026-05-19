@@ -5,6 +5,7 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 const staticLoginOtp = String(import.meta.env.VITE_STATIC_LOGIN_OTP || '123456').trim();
 const staticLoginPassword = String(import.meta.env.VITE_STATIC_LOGIN_PASSWORD || staticLoginOtp).trim();
 const staticLoginEnabled = Boolean(staticLoginOtp);
+const assumedAverageSpeedKmph = 24;
 
 export const supabaseDirectEnabled = Boolean(supabaseUrl && supabaseAnonKey);
 
@@ -649,7 +650,7 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     row.today_distance,
     row.distance_today_km,
   )) ?? 0;
-  const runningMinutes = minutesFromTelemetry(firstValue(
+  const rawRunningMinutes = minutesFromTelemetry(firstValue(
     source.today_running_minutes,
     raw['time today'],
     raw.today_running_minutes,
@@ -658,8 +659,9 @@ function normalizeVehicle(row, index = 0, latestSnapshot = null, settings = norm
     row.running_minutes,
     row.running_time,
   ));
+  const runningMinutes = effectiveRunningMinutes(todayDistance, rawRunningMinutes);
   const runningTime = minutesLabel(runningMinutes) || firstText(row.running_time, raw.running_time, '0h 0m');
-  const avgSpeed = averageSpeedLabel(todayDistance, runningMinutes, firstValue(
+  const avgSpeed = averageSpeedLabel(todayDistance, rawRunningMinutes, firstValue(
     source.today_avg_speed_kmph,
     raw['average speed(calculated from distance and time)'],
     raw.today_avg_speed_kmph,
@@ -975,11 +977,12 @@ function stopHistoryForVehicle(row, latestSnapshot = null) {
       const key = `${dateKey(scrapedAt)}:${location}`;
       if (!location || seen.has(key)) return null;
       seen.add(key);
-      const minutes = minutesFromTelemetry(firstValue(snapshot.today_running_minutes, raw['time today']));
+      const distanceTodayKm = numberFromTelemetry(firstValue(snapshot.distance_today_km, raw['Dist._today'])) ?? 0;
+      const minutes = effectiveRunningMinutes(distanceTodayKm, minutesFromTelemetry(firstValue(snapshot.today_running_minutes, raw['time today'])));
       return {
         location,
         scrapedAt,
-        distanceTodayKm: numberFromTelemetry(firstValue(snapshot.distance_today_km, raw['Dist._today'])) ?? 0,
+        distanceTodayKm,
         runningTime: minutesLabel(minutes) || '0h 0m',
         status: normalizeStatus(firstValue(snapshot.movement_status_raw, raw['current status of vehicle'])),
       };
@@ -1163,9 +1166,20 @@ function minutesLabel(value) {
   return `${hours}h ${mins}m`;
 }
 
+function effectiveRunningMinutes(distanceKm, runningMinutes) {
+  const distance = Number(distanceKm);
+  const minutes = Number(runningMinutes);
+  if (Number.isFinite(minutes) && minutes > 0) return minutes;
+  if (Number.isFinite(distance) && distance > 0) return (distance / assumedAverageSpeedKmph) * 60;
+  return minutes;
+}
+
 function averageSpeedLabel(distanceKm, runningMinutes, fallback = '') {
   const distance = Number(distanceKm);
   const minutes = Number(runningMinutes);
+  if (Number.isFinite(distance) && distance > 0 && (!Number.isFinite(minutes) || minutes <= 0)) {
+    return `${assumedAverageSpeedKmph} km/h`;
+  }
   if (Number.isFinite(distance) && Number.isFinite(minutes) && minutes > 0) {
     return `${(distance / (minutes / 60)).toFixed(1)} km/h`;
   }

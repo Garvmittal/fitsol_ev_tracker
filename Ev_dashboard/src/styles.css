@@ -1301,13 +1301,6 @@ h1 {
   padding-right: 18px;
 }
 
-.stop-timeline-card span {
-  color: var(--green-2);
-  font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-
 .stop-timeline-card strong {
   color: var(--ink);
   display: -webkit-box;

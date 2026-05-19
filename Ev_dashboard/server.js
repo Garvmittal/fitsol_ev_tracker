@@ -33,6 +33,7 @@ const alertMinRunningMinutes = Number(process.env.ALERT_MIN_RUNNING_MINUTES || 6
 const alertMinDistanceKm = Number(process.env.ALERT_MIN_DISTANCE_KM || 1);
 const cngConsumptionKgPerKm = Number(process.env.CNG_CONSUMPTION_KG_PER_KM || 0.18);
 const evEnergyKwhPerKm = Number(process.env.EV_ENERGY_KWH_PER_KM || 0.22);
+const assumedAverageSpeedKmph = 24;
 const otpStore = new Map();
 const sessions = new Map();
 const useSupabase = process.env.USE_SUPABASE === 'true';
@@ -891,8 +892,9 @@ function normalizeFleetRecords(records, settings = defaultSettings()) {
       const lng = optionalNumber(record, 'longitude', 'lng', 'long', 'lon');
       const todayDistance = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
       const energyToday = optionalNumber(record, 'energy_today_kwh', 'energy consumed', 'energy') ?? 0;
-      const runningMinutes = optionalNumber(record, 'today_running_minutes', 'time today', 'running_minutes');
-      const avgSpeed = field(record, 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'avg_speed');
+      const rawRunningMinutes = optionalNumber(record, 'today_running_minutes', 'time today', 'running_minutes', 'running_time', 'runningTime');
+      const runningMinutes = effectiveRunningMinutes(todayDistance, rawRunningMinutes);
+      const avgSpeed = averageSpeedLabel(todayDistance, rawRunningMinutes, field(record, 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'avg_speed'));
       const temp = field(record, 'battery_temperature_c', 'temp', 'temperature');
       const odometer = field(record, 'odometer_km', 'odometer');
       const locationText = field(record, 'location_text', 'location', 'last_location');
@@ -909,8 +911,8 @@ function normalizeFleetRecords(records, settings = defaultSettings()) {
         battery: battery && battery <= 100 ? Math.round(battery) : 0,
         distance: 0,
         todayDistance,
-        runningTime: field(record, 'running_time', 'runningTime') || minutesLabel(runningMinutes),
-        avgSpeed: formatWithUnit(avgSpeed, 'km/h'),
+        runningTime: minutesLabel(runningMinutes) || field(record, 'running_time', 'runningTime'),
+        avgSpeed,
         temp: formatWithUnit(temp, 'C'),
         odometer: formatWithUnit(odometer, 'km'),
         energy: formatWithUnit(energyToday, 'kWh'),
@@ -1147,11 +1149,12 @@ function stopHistoryForRecord(record) {
       const key = `${dateKey(scrapedAt)}:${location}`;
       if (!location || seen.has(key)) return null;
       seen.add(key);
-      const runningMinutes = optionalNumber(snapshot, 'today_running_minutes', 'time today', 'running_minutes');
+      const distanceTodayKm = optionalNumber(snapshot, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+      const runningMinutes = effectiveRunningMinutes(distanceTodayKm, optionalNumber(snapshot, 'today_running_minutes', 'time today', 'running_minutes'));
       return {
         location,
         scrapedAt,
-        distanceTodayKm: optionalNumber(snapshot, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0,
+        distanceTodayKm,
         runningTime: minutesLabel(runningMinutes),
         status: normalizeStatus(field(snapshot, 'movement_status_raw', 'current status of vehicle', 'status')),
       };
@@ -2209,6 +2212,22 @@ function minutesLabel(value) {
   const hours = Math.floor(minutes / 60);
   const mins = Math.round(minutes % 60);
   return hours ? `${hours}h ${mins}m` : `${mins}m`;
+}
+
+function effectiveRunningMinutes(distanceKm, runningMinutes) {
+  const distance = toNumber(distanceKm);
+  const minutes = toNumber(runningMinutes);
+  if (minutes > 0) return minutes;
+  if (distance > 0) return (distance / assumedAverageSpeedKmph) * 60;
+  return minutes;
+}
+
+function averageSpeedLabel(distanceKm, runningMinutes, fallback = '') {
+  const distance = toNumber(distanceKm);
+  const minutes = toNumber(runningMinutes);
+  if (distance > 0 && minutes <= 0) return `${assumedAverageSpeedKmph} km/h`;
+  if (distance > 0 && minutes > 0) return `${(distance / (minutes / 60)).toFixed(1)} km/h`;
+  return formatWithUnit(fallback, 'km/h');
 }
 
 app.listen(port, '0.0.0.0', () => {

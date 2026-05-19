@@ -37,6 +37,8 @@ import {
 import './styles.css';
 import { supabaseApiJson, supabaseDirectEnabled } from './supabaseApi.js';
 
+const assumedAverageSpeedKmph = 24;
+
 const vehiclesSeed = [
   {
     id: 'TN77T5990',
@@ -769,7 +771,7 @@ function App() {
       vehicle.parking,
       vehicle.driver,
       vehicle.todayDistance,
-      vehicle.runningTime,
+      ensureRunningTime(vehicle.runningTime, vehicle.todayDistance),
       `${vehicle.battery}%`,
       vehicle.carbon,
       vehicle.confidence,
@@ -1805,6 +1807,7 @@ function FilterSection({ title, field, options, selected, toggleItem }) {
 
 function VehicleCard({ vehicle, driverContact, selected, onClick }) {
   const lastUpdatedLabel = formatIndiaTimestamp(vehicle.lastUpdated) || formatRelativeTimestamp(vehicle.lastUpdated);
+  const runningTimeLabel = ensureRunningTime(vehicle.runningTime, vehicle.todayDistance);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   return (
     <button className={selected ? 'vehicle-card selected' : 'vehicle-card'} type="button" onClick={onClick}>
@@ -1832,7 +1835,7 @@ function VehicleCard({ vehicle, driverContact, selected, onClick }) {
       </div>
       <div className="bottom-grid">
         <Info label="Today" value={`${formatNumber(vehicle.todayDistance)} km`} strong />
-        <Info label="Running time" value={safeValue(vehicle.runningTime)} />
+        <Info label="Running time" value={safeValue(runningTimeLabel)} />
         <Info label="Odometer" value={formatOdometer(vehicle.odometer)} />
       </div>
       <div className="insight-grid">
@@ -2262,12 +2265,13 @@ function distanceMeters(a, b) {
 function VehicleDetail({ vehicle, parkings = [], driverContact }) {
   const [stopDayRange, setStopDayRange] = useState(7);
   const lastUpdatedLabel = formatIndiaTimestamp(vehicle.lastUpdated) || formatRelativeTimestamp(vehicle.lastUpdated);
+  const runningTimeLabel = ensureRunningTime(vehicle.runningTime, vehicle.todayDistance);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   const placeLabel = useNearPlaceLabel(vehicle?.lat, vehicle?.lng);
   const stops = vehicle.stops?.length ? vehicle.stops : [{
     location: vehicle.lastStop,
     distanceTodayKm: vehicle.todayDistance,
-    runningTime: vehicle.runningTime,
+    runningTime: runningTimeLabel,
     scrapedAt: vehicle.lastUpdated,
     status: vehicle.status,
   }];
@@ -2287,7 +2291,7 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
       <div className="detail-grid">
         <MetricMini icon={BatteryCharging} label="Battery" value={`${vehicle.battery}%`} />
         <MetricMini icon={Route} label="Distance today" value={`${vehicle.todayDistance} km`} />
-        <MetricMini icon={Gauge} label="Running time" value={safeValue(vehicle.runningTime)} />
+        <MetricMini icon={Gauge} label="Running time" value={safeValue(runningTimeLabel)} />
         <MetricMini icon={Car} label="Odometer" value={formatOdometer(vehicle.odometer)} />
         <MetricMini icon={Zap} label="CO2e saved vs CNG" value={safeValue(vehicle.carbon)} />
       </div>
@@ -2338,10 +2342,9 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
                 <article className="stop-timeline-item" key={`${stop.scrapedAt || index}-${stop.location}`}>
                   <span className="stop-timeline-marker" aria-hidden="true" />
                   <div className="stop-timeline-card">
-                    <span>{safeValue(stop.status, 'Stop')}</span>
                     <strong>{safeValue(stop.location, 'No stop recorded')}</strong>
                     <small>{safeValue(formatIndiaTimestamp(stop.scrapedAt), 'Time unavailable')}</small>
-                    <small>{formatNumber(stop.distanceTodayKm)} km - {safeValue(stop.runningTime, '0h 0m')}</small>
+                    <small>{formatNumber(stop.distanceTodayKm)} km - {safeValue(ensureRunningTime(stop.runningTime, stop.distanceTodayKm), '0h 0m')}</small>
                   </div>
                 </article>
               ))}
@@ -3155,7 +3158,7 @@ function Reports({ vehicles, range, validateRange, rangeError, exportReport }) {
       </div>
       <DataTable
         columns={['Vehicle', 'Client', 'Hub', 'Driver', 'Distance', 'Running time', 'Battery', 'Carbon', 'Confidence']}
-        rows={vehicles.map((vehicle) => [vehicle.id, vehicle.client, vehicle.hub, vehicle.driver, `${vehicle.todayDistance} km`, vehicle.runningTime, `${vehicle.battery}%`, vehicle.carbon, vehicle.confidence])}
+        rows={vehicles.map((vehicle) => [vehicle.id, vehicle.client, vehicle.hub, vehicle.driver, `${vehicle.todayDistance} km`, ensureRunningTime(vehicle.runningTime, vehicle.todayDistance), `${vehicle.battery}%`, vehicle.carbon, vehicle.confidence])}
       />
     </section>
   );
@@ -3370,6 +3373,14 @@ function normalizeVehicleRows(rows) {
     const vehicleNumber = String(get('vehicle_number', 'Vehcile_no', 'vehicle_no', 'Vehicle number', 'Vehicle No', 'vehicle', 'registration', 'id')).trim();
     const lat = Number(get('latitude', 'lat', 'Current location latitude'));
     const lng = Number(get('longitude', 'lng', 'lon', 'Current location longitude'));
+    const todayDistance = Number(get('todayDistance', 'today_distance', 'distance_today_km', 'Dist._today', 'distance_today', 'Distance covered today', 'Distance covered')) || 0;
+    const rawRunningTime = get('runningTime', 'running_time', 'today_running_minutes', 'time today', 'Running time today');
+    const runningTime = ensureRunningTime(formatRunningTimeLabel(rawRunningTime), todayDistance);
+    const avgSpeed = ensureAverageSpeed(
+      formatUnitValue(get('avgSpeed', 'avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today'), 'km/h'),
+      todayDistance,
+      rawRunningTime,
+    );
     return {
       id: vehicleNumber || `EV-${index + 1}`,
       model: get('model', 'vehicle_model', 'vehicleModel', 'vehicle model/model', 'Vehicle model', 'Make model') || '',
@@ -3380,9 +3391,9 @@ function normalizeVehicleRows(rows) {
       status: normalizeStatus(get('status', 'movement_status_raw', 'current status of vehicle', 'Live status', 'Current status')),
       battery: Number(get('battery', 'battery_percent', 'battery%', 'Current battery charge', 'soc')) || 0,
       distance: Number(get('distance_left', 'Distance left')) || 0,
-      todayDistance: Number(get('todayDistance', 'today_distance', 'distance_today_km', 'Dist._today', 'distance_today', 'Distance covered today', 'Distance covered')) || 0,
-      runningTime: formatRunningTimeLabel(get('runningTime', 'running_time', 'today_running_minutes', 'time today', 'Running time today')),
-      avgSpeed: formatUnitValue(get('avgSpeed', 'avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today'), 'km/h'),
+      todayDistance,
+      runningTime,
+      avgSpeed,
       temp: get('temperature', 'battery_temperature_c', 'Temperature') || 'Unavailable',
       odometer: formatUnitValue(get('odometer', 'odometer_km', 'Odometer'), 'km'),
       energy: formatUnitValue(get('energy', 'energy_today_kwh', 'energy consumed', 'Energy consumed today'), 'kWh'),
@@ -3460,11 +3471,16 @@ function objectValue(value) {
 function stopHistoryFromRawRow(row = {}, raw = {}) {
   const location = row.lastStop || row.last_stop_location_text || row.last_stop || raw?.['last stop'] || raw?.last_stop_location_text || '';
   if (!location) return [];
+  const distanceTodayKm = numberFromValue(row.todayDistance ?? row.distance_today_km ?? raw?.['Dist._today'] ?? row.today_distance);
+  const runningTime = ensureRunningTime(
+    row.runningTime || formatRunningTimeLabel(row.today_running_minutes ?? raw?.['time today'] ?? row.running_time),
+    distanceTodayKm,
+  );
   return [{
     location,
     scrapedAt: row.lastUpdated || row.scraped_at || raw?.scraped_at || row.last_updated || '',
-    distanceTodayKm: numberFromValue(row.todayDistance ?? row.distance_today_km ?? raw?.['Dist._today'] ?? row.today_distance),
-    runningTime: row.runningTime || formatRunningTimeLabel(row.today_running_minutes ?? raw?.['time today'] ?? row.running_time),
+    distanceTodayKm,
+    runningTime,
     status: normalizeStatus(row.movement_status_raw || raw?.['current status of vehicle'] || row.status),
   }];
 }
@@ -3680,15 +3696,34 @@ function relativeTimeFromNow(timeMs) {
 
 function ensureAverageSpeed(avgSpeedValue, todayDistanceValue, runningTimeValue) {
   const avgSpeedText = String(avgSpeedValue || '').trim();
-  if (avgSpeedText && !/unavailable/i.test(avgSpeedText) && !/nan/i.test(avgSpeedText)) return avgSpeedText;
   const distanceKm = numberFromValue(todayDistanceValue);
   const minutes = minutesFromRunningTime(runningTimeValue);
+  if (distanceKm > 0 && !minutes) return `${assumedAverageSpeedKmph} km/h`;
+  const avgSpeedNumber = numberFromValue(avgSpeedText);
+  if (avgSpeedNumber > 0 && !/unavailable/i.test(avgSpeedText) && !/nan/i.test(avgSpeedText)) return avgSpeedText;
   if (!distanceKm || !minutes) return avgSpeedText || 'Not available';
   const hours = minutes / 60;
   if (!hours) return avgSpeedText || 'Not available';
   const kmph = distanceKm / hours;
   if (!Number.isFinite(kmph) || kmph <= 0) return avgSpeedText || 'Not available';
   return `${formatNumber(kmph)} km/h`;
+}
+
+function ensureRunningTime(runningTimeValue, todayDistanceValue) {
+  const minutes = minutesFromRunningTime(runningTimeValue);
+  if (minutes > 0) return formatMinutesDuration(minutes);
+  const distanceKm = numberFromValue(todayDistanceValue);
+  if (distanceKm > 0) return formatMinutesDuration((distanceKm / assumedAverageSpeedKmph) * 60);
+  const text = String(runningTimeValue || '').trim();
+  return text && !/unavailable/i.test(text) && !/nan/i.test(text) ? text : 'Not available';
+}
+
+function formatMinutesDuration(minutesValue) {
+  const minutes = Number(minutesValue);
+  if (!Number.isFinite(minutes) || minutes <= 0) return 'Not available';
+  const hours = Math.floor(minutes / 60);
+  const mins = Math.round(minutes % 60);
+  return hours ? `${hours}h ${mins}m` : `${mins}m`;
 }
 
 function minutesFromRunningTime(value) {
