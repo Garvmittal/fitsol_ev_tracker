@@ -2260,6 +2260,7 @@ function distanceMeters(a, b) {
 }
 
 function VehicleDetail({ vehicle, parkings = [], driverContact }) {
+  const [stopDayRange, setStopDayRange] = useState(7);
   const lastUpdatedLabel = formatIndiaTimestamp(vehicle.lastUpdated) || formatRelativeTimestamp(vehicle.lastUpdated);
   const avgSpeedLabel = ensureAverageSpeed(vehicle.avgSpeed, vehicle.todayDistance, vehicle.runningTime);
   const placeLabel = useNearPlaceLabel(vehicle?.lat, vehicle?.lng);
@@ -2270,6 +2271,10 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
     scrapedAt: vehicle.lastUpdated,
     status: vehicle.status,
   }];
+  const visibleStops = stops
+    .filter((stop) => isWithinDayRange(stop.scrapedAt, stopDayRange))
+    .slice(0, 10);
+  const stopRangeOptions = [1, 2, 7];
   return (
     <section className="detail-panel">
       <div className="detail-heading">
@@ -2310,15 +2315,40 @@ function VehicleDetail({ vehicle, parkings = [], driverContact }) {
           {vehicle.parkingGmpLink && <p><ActionLink href={vehicle.parkingGmpLink} icon={ParkingCircle} label="Open parking map" /></p>}
           <p>Carbon basis: {safeValue(vehicle.confidence, 'Estimated vs CNG')}</p>
         </div>
-        <div>
-          <h3>Stops</h3>
-          {stops.slice(0, 10).map((stop, index) => (
-            <div className="stop-history-item" key={`${stop.scrapedAt || index}-${stop.location}`}>
-              <p>{safeValue(stop.location, 'No stop recorded')}</p>
-              <span>{safeValue(formatIndiaTimestamp(stop.scrapedAt), 'Time unavailable')} · {safeValue(stop.status, 'Status unavailable')}</span>
-              <span>{formatNumber(stop.distanceTodayKm)} km · {safeValue(stop.runningTime, '0h 0m')}</span>
+        <div className="stops-panel">
+          <div className="stops-heading">
+            <h3>Stops</h3>
+            <div className="stop-range-control" role="group" aria-label="Stops day range">
+              {stopRangeOptions.map((days) => (
+                <button
+                  type="button"
+                  key={days}
+                  className={stopDayRange === days ? 'active' : ''}
+                  aria-pressed={stopDayRange === days}
+                  onClick={() => setStopDayRange(days)}
+                >
+                  Last {days} {days === 1 ? 'Day' : 'Days'}
+                </button>
+              ))}
             </div>
-          ))}
+          </div>
+          {visibleStops.length ? (
+            <div className="stop-timeline" aria-label={`Stops from last ${stopDayRange} ${stopDayRange === 1 ? 'day' : 'days'}`}>
+              {visibleStops.map((stop, index) => (
+                <article className="stop-timeline-item" key={`${stop.scrapedAt || index}-${stop.location}`}>
+                  <span className="stop-timeline-marker" aria-hidden="true" />
+                  <div className="stop-timeline-card">
+                    <span>{safeValue(stop.status, 'Stop')}</span>
+                    <strong>{safeValue(stop.location, 'No stop recorded')}</strong>
+                    <small>{safeValue(formatIndiaTimestamp(stop.scrapedAt), 'Time unavailable')}</small>
+                    <small>{formatNumber(stop.distanceTodayKm)} km - {safeValue(stop.runningTime, '0h 0m')}</small>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="stop-empty">No stops recorded in this range</p>
+          )}
         </div>
       </div>
     </section>
@@ -3298,12 +3328,16 @@ async function loadProductionVehicles() {
           if (!response.ok) throw new Error(`API ${response.status}`);
           return response.json();
         });
-    const rows = Array.isArray(payload) ? payload : payload.vehicles;
+    const rows = Array.isArray(payload) ? payload : (payload.vehicles || []);
     const alreadyNormalized = (rows || []).every((row) => (
       row.id
-      && row.lat !== undefined
-      && row.lng !== undefined
-      && (row.todayDistance !== undefined || row.runningTime !== undefined || row.lastStop !== undefined)
+      && (
+        row.todayDistance !== undefined
+        || row.runningTime !== undefined
+        || row.avgSpeed !== undefined
+        || row.lastStop !== undefined
+        || row.lastUpdated !== undefined
+      )
     ));
     if (alreadyNormalized) return rows;
     return normalizeVehicleRows(rows || []);
@@ -3338,29 +3372,29 @@ function normalizeVehicleRows(rows) {
     const lng = Number(get('longitude', 'lng', 'lon', 'Current location longitude'));
     return {
       id: vehicleNumber || `EV-${index + 1}`,
-      model: get('model', 'vehicle_model', 'vehicle model/model', 'Vehicle model', 'Make model') || '',
-      sourceSystem: get('source_system', 'source', 'Source system') || '',
+      model: get('model', 'vehicle_model', 'vehicleModel', 'vehicle model/model', 'Vehicle model', 'Make model') || '',
+      sourceSystem: get('sourceSystem', 'source_system', 'source', 'Source system') || '',
       client: get('client', 'Client') || 'Unassigned client',
       hub: get('hub', 'Client hub', 'Hub') || 'Unassigned hub',
       parking: get('parking', 'Parking location') || 'Parking unavailable',
       status: normalizeStatus(get('status', 'movement_status_raw', 'current status of vehicle', 'Live status', 'Current status')),
       battery: Number(get('battery', 'battery_percent', 'battery%', 'Current battery charge', 'soc')) || 0,
       distance: Number(get('distance_left', 'Distance left')) || 0,
-      todayDistance: Number(get('today_distance', 'distance_today_km', 'Dist._today', 'distance_today', 'Distance covered today', 'Distance covered')) || 0,
-      runningTime: formatRunningTimeLabel(get('running_time', 'today_running_minutes', 'time today', 'Running time today')),
-      avgSpeed: formatUnitValue(get('avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today'), 'km/h'),
+      todayDistance: Number(get('todayDistance', 'today_distance', 'distance_today_km', 'Dist._today', 'distance_today', 'Distance covered today', 'Distance covered')) || 0,
+      runningTime: formatRunningTimeLabel(get('runningTime', 'running_time', 'today_running_minutes', 'time today', 'Running time today')),
+      avgSpeed: formatUnitValue(get('avgSpeed', 'avg_speed', 'today_avg_speed_kmph', 'average speed(calculated from distance and time)', 'average_speed', 'Average speed today'), 'km/h'),
       temp: get('temperature', 'battery_temperature_c', 'Temperature') || 'Unavailable',
       odometer: formatUnitValue(get('odometer', 'odometer_km', 'Odometer'), 'km'),
       energy: formatUnitValue(get('energy', 'energy_today_kwh', 'energy consumed', 'Energy consumed today'), 'kWh'),
       eta: get('eta', 'Estimated Time of Arrival') || 'Unavailable',
       etaDate: get('eta_date', 'ETA date') || '06-05-2026',
-      lastUpdated: get('last_updated', 'scraped_at', 'created_at', 'Last updated', 'Vehicle updated timestamp') || 'Unavailable',
-      driverState: get('driver_state') || 'none',
+      lastUpdated: get('lastUpdated', 'last_updated', 'scraped_at', 'created_at', 'Last updated', 'Vehicle updated timestamp') || 'Unavailable',
+      driverState: get('driverState', 'driver_state') || 'none',
       driver: get('driver', 'Active driver', 'Assigned driver', 'Last driver') || 'No driver confirmed yet',
-      driverMeta: get('driver_meta') || 'Loaded from production source',
+      driverMeta: get('driverMeta', 'driver_meta') || 'Loaded from production source',
       route: get('route', 'Route') || 'Route unavailable',
       location: get('location', 'Current location text') || 'Location unavailable',
-      lastStop: get('last_stop', 'last_stop_location_text', 'last stop', 'Last stop text address') || 'Last stop unavailable',
+      lastStop: get('lastStop', 'last_stop', 'last_stop_location_text', 'last stop', 'Last stop text address') || 'Last stop unavailable',
       carbon: get('carbon', 'Carbon saved vs CNG') || 'Unavailable',
       confidence: get('carbon_confidence', 'Carbon confidence') || 'Unavailable',
       stops: Array.isArray(row.stops) ? row.stops : stopHistoryFromRawRow(row, rawPayload || metadata),
@@ -3424,13 +3458,13 @@ function objectValue(value) {
 }
 
 function stopHistoryFromRawRow(row = {}, raw = {}) {
-  const location = row.last_stop_location_text || row.last_stop || raw?.['last stop'] || raw?.last_stop_location_text || '';
+  const location = row.lastStop || row.last_stop_location_text || row.last_stop || raw?.['last stop'] || raw?.last_stop_location_text || '';
   if (!location) return [];
   return [{
     location,
-    scrapedAt: row.scraped_at || raw?.scraped_at || row.last_updated || '',
-    distanceTodayKm: numberFromValue(row.distance_today_km ?? raw?.['Dist._today'] ?? row.today_distance),
-    runningTime: formatRunningTimeLabel(row.today_running_minutes ?? raw?.['time today'] ?? row.running_time),
+    scrapedAt: row.lastUpdated || row.scraped_at || raw?.scraped_at || row.last_updated || '',
+    distanceTodayKm: numberFromValue(row.todayDistance ?? row.distance_today_km ?? raw?.['Dist._today'] ?? row.today_distance),
+    runningTime: row.runningTime || formatRunningTimeLabel(row.today_running_minutes ?? raw?.['time today'] ?? row.running_time),
     status: normalizeStatus(row.movement_status_raw || raw?.['current status of vehicle'] || row.status),
   }];
 }
@@ -3454,13 +3488,8 @@ function formatRunningTimeLabel(value) {
 }
 
 function formatIndiaTimestamp(value) {
-  const text = String(value || '').trim();
-  if (!text || /^unavailable$/i.test(text)) return '';
-  const normalized = text.includes(' ') && /[+-]\d\d$/.test(text)
-    ? text.replace(' ', 'T').replace(/([+-]\d\d)$/, '$1:00')
-    : text;
-  const date = new Date(normalized);
-  if (Number.isNaN(date.getTime())) return '';
+  const date = parseTelemetryDate(value);
+  if (!date) return '';
   return new Intl.DateTimeFormat('en-IN', {
     timeZone: 'Asia/Kolkata',
     day: '2-digit',
@@ -3469,6 +3498,23 @@ function formatIndiaTimestamp(value) {
     hour: '2-digit',
     minute: '2-digit',
   }).format(date);
+}
+
+function isWithinDayRange(value, days) {
+  const date = parseTelemetryDate(value);
+  if (!date) return true;
+  const rangeMs = Number(days) * 24 * 60 * 60 * 1000;
+  return Date.now() - date.getTime() <= rangeMs;
+}
+
+function parseTelemetryDate(value) {
+  const text = String(value || '').trim();
+  if (!text || /^unavailable$/i.test(text)) return null;
+  const normalized = text
+    .replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T')
+    .replace(/([+-]\d\d)$/, '$1:00');
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function parkingLocationsFor(clientHubs = [], parkings = []) {
