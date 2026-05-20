@@ -2505,6 +2505,39 @@ th {
   text-align: right;
 }
 
+.ops-table th.ops-action-col {
+  min-width: 190px;
+  padding-right: 22px;
+  text-align: center;
+}
+
+.ops-table td.ops-action-col {
+  align-items: center;
+  display: flex;
+  gap: 14px;
+  justify-content: flex-end;
+  min-width: 190px;
+  padding-right: 22px;
+}
+
+.ops-table td.ops-action-col .ghost-action.compact-action {
+  border-color: #00a060;
+  border-radius: 999px;
+  color: #007d5a;
+  flex: 0 0 52px;
+  height: 52px;
+  min-height: 52px;
+  padding: 0;
+}
+
+.ops-table td.ops-action-col .primary-action.compact-action {
+  border-radius: 999px;
+  flex: 0 0 auto;
+  min-height: 52px;
+  min-width: 116px;
+  padding: 0 22px;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -2654,5 +2687,16 @@ th {
   }
   .ops-action-col {
     text-align: left;
+  }
+  .ops-table th.ops-action-col,
+  .ops-table td.ops-action-col {
+    min-width: 170px;
+    padding-right: 12px;
+  }
+  .ops-table td.ops-action-col {
+    justify-content: flex-start;
+  }
+  .ops-table td.ops-action-col .primary-action.compact-action {
+    min-width: 104px;
   }
 }
