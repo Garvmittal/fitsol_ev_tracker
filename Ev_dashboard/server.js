@@ -1897,19 +1897,20 @@ function buildCarbonSummary(records, settings) {
 }
 
 function carbonSnapshotDailyTotals(records, settings) {
-  const latestByDayVehicle = new Map();
+  const maxDistanceByDayVehicle = new Map();
   for (const record of records) {
     const dayKey = indiaDateKey(field(record, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'updated_at', 'created_at'));
     const vehicle = vehicleIdFromRecord(record);
     if (!dayKey || !vehicle) continue;
     const key = `${dayKey}:${vehicle}`;
-    const previous = latestByDayVehicle.get(key);
-    if (carbonRecordTimeMs(record) >= carbonRecordTimeMs(previous)) latestByDayVehicle.set(key, record);
+    const distanceKm = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+    const previous = maxDistanceByDayVehicle.get(key);
+    if (!previous || distanceKm > previous.distanceKm) {
+      maxDistanceByDayVehicle.set(key, { dayKey, distanceKm });
+    }
   }
   const totals = new Map();
-  latestByDayVehicle.forEach((record, key) => {
-    const dayKey = key.slice(0, 10);
-    const distanceKm = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+  maxDistanceByDayVehicle.forEach(({ dayKey, distanceKm }) => {
     const carbonKg = carbonSavedVsCng(distanceKm, null, settings);
     const total = totals.get(dayKey) || { distanceKm: 0, carbonKg: 0 };
     total.distanceKm += distanceKm;
@@ -1917,11 +1918,6 @@ function carbonSnapshotDailyTotals(records, settings) {
     totals.set(dayKey, total);
   });
   return totals;
-}
-
-function carbonRecordTimeMs(record = {}) {
-  const time = new Date(field(record, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'updated_at', 'created_at') || 0).getTime();
-  return Number.isFinite(time) ? time : 0;
 }
 
 function trendStartDate(period) {

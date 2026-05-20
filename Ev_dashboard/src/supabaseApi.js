@@ -1067,19 +1067,20 @@ function buildCarbonSummary(records, settings) {
 }
 
 function carbonSnapshotDailyTotals(records, settings) {
-  const latestByDayVehicle = new Map();
+  const maxDistanceByDayVehicle = new Map();
   records.forEach((record) => {
     const dayKey = indiaDateKey(record.scraped_at || record.last_updated || record.created_at);
     const vehicle = vehicleKeyFromSnapshot(record);
     if (!dayKey || !vehicle) return;
     const key = `${dayKey}:${vehicle}`;
-    const previous = latestByDayVehicle.get(key);
-    if (carbonRecordTimeMs(record) >= carbonRecordTimeMs(previous)) latestByDayVehicle.set(key, record);
+    const distanceKm = carbonDistanceFromSnapshot(record);
+    const previous = maxDistanceByDayVehicle.get(key);
+    if (!previous || distanceKm > previous.distanceKm) {
+      maxDistanceByDayVehicle.set(key, { dayKey, distanceKm });
+    }
   });
   const totals = new Map();
-  latestByDayVehicle.forEach((record, key) => {
-    const dayKey = key.slice(0, 10);
-    const distanceKm = carbonDistanceFromSnapshot(record);
+  maxDistanceByDayVehicle.forEach(({ dayKey, distanceKm }) => {
     const carbonKg = carbonSavedVsCng(distanceKm, null, settings);
     const total = totals.get(dayKey) || { distanceKm: 0, carbonKg: 0 };
     total.distanceKm += distanceKm;
@@ -1100,11 +1101,6 @@ function carbonDistanceFromSnapshot(record = {}) {
     raw.distance_today,
     raw.distance,
   )) ?? 0;
-}
-
-function carbonRecordTimeMs(record = {}) {
-  const time = new Date(record?.scraped_at || record?.last_updated || record?.created_at || 0).getTime();
-  return Number.isFinite(time) ? time : 0;
 }
 
 function normalizeSettings(input = {}) {
