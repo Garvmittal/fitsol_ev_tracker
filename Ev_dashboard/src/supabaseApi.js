@@ -6,6 +6,7 @@ const staticLoginOtp = String(import.meta.env.VITE_STATIC_LOGIN_OTP || '123456')
 const staticLoginPassword = String(import.meta.env.VITE_STATIC_LOGIN_PASSWORD || staticLoginOtp).trim();
 const staticLoginEnabled = Boolean(staticLoginOtp);
 const assumedAverageSpeedKmph = 24;
+const indiaOffsetMs = 5.5 * 60 * 60 * 1000;
 
 export const supabaseDirectEnabled = Boolean(supabaseUrl && supabaseAnonKey);
 
@@ -54,6 +55,7 @@ export async function supabaseApiJson(url, options = {}) {
   if (path === '/api/settings' && method === 'GET') return getSettings();
   if (path === '/api/settings' && method === 'POST') return saveSettings(body, user);
   if (path === '/api/carbon-trend' && method === 'GET') return getCarbonTrend(query.get('period'));
+  if (path === '/api/carbon-summary' && method === 'GET') return getCarbonSummary();
   if (path === '/api/alerts/preview' && method === 'GET') return getAlertPreview(user);
   if (path === '/api/alerts/send' && method === 'POST') return sendAlertsDryRun(user);
   if (path === '/api/reverse-geocode' && method === 'GET') return { ok: true, place: '' };
@@ -646,15 +648,29 @@ async function saveSettings(body, user) {
 
 async function getCarbonTrend(periodValue) {
   const period = ['week', 'month', 'year'].includes(periodValue) ? periodValue : 'week';
-  const start = trendStartDate(period).toISOString();
-  const { data, error } = await supabase
-    .from('vehicle_snapshots')
-    .select('*')
-    .gte('scraped_at', start)
-    .order('scraped_at', { ascending: true });
-  if (error) throw error;
+  const data = await listCarbonSnapshots(trendStartDate(period).toISOString());
   const { settings } = await getSettings();
   return { period, unit: 'kgCO2e', points: buildCarbonTrend(data || [], period, settings) };
+}
+
+async function getCarbonSummary() {
+  const [data, { settings }] = await Promise.all([
+    listCarbonSnapshots(),
+    getSettings(),
+  ]);
+  return { unit: 'kgCO2e', ...buildCarbonSummary(data || [], settings) };
+}
+
+async function listCarbonSnapshots(startIso = '') {
+  let request = supabase
+    .from('vehicle_snapshots')
+    .select('id,vehicle_id,vehicle_number,scraped_at,created_at,distance_today_km,today_distance,raw_payload')
+    .order('scraped_at', { ascending: true })
+    .limit(50000);
+  if (startIso) request = request.gte('scraped_at', startIso);
+  const { data, error } = await request;
+  if (error) throw error;
+  return data || [];
 }
 
 async function getAlertPreview(user) {
@@ -1010,31 +1026,85 @@ function buildMovementAlerts(records, settings, deploymentContext = new Map()) {
 
 function buildCarbonTrend(records, period, settings) {
   const bucketMap = new Map(trendBuckets(period).map((bucket) => [bucket.key, { ...bucket, value: 0 }]));
-  const latestByBucketVehicle = new Map();
-  records.forEach((record) => {
-    const date = new Date(record.scraped_at || record.last_updated || record.created_at || 0);
-    if (Number.isNaN(date.getTime())) return;
-    const key = period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10);
+  carbonSnapshotDailyTotals(records, settings).forEach((total, dayKey) => {
+    const key = period === 'year' ? dayKey.slice(0, 7) : dayKey;
     const bucket = bucketMap.get(key);
     if (!bucket) return;
-    const vehicle = vehicleKey(record.vehicle_number || record.vehicle_id || record.id);
-    if (!vehicle) return;
-    const mapKey = `${key}:${vehicle}`;
-    const previous = latestByBucketVehicle.get(mapKey);
-    const previousTime = previous ? new Date(previous.scraped_at || previous.created_at || 0).getTime() : -1;
-    if (date.getTime() < previousTime) return;
-    latestByBucketVehicle.set(mapKey, record);
-  });
-  latestByBucketVehicle.forEach((record, mapKey) => {
-    const key = mapKey.split(':')[0];
-    const bucket = bucketMap.get(key);
-    if (!bucket) return;
-    const distance = numberFromTelemetry(record.distance_today_km ?? record.today_distance) ?? 0;
-    const energy = numberFromTelemetry(record.energy_today_kwh ?? record.energy);
-    const carbon = carbonSavedVsCng(distance, energy, settings);
-    if (Number.isFinite(carbon)) bucket.value += carbon;
+    bucket.value += total.carbonKg;
   });
   return [...bucketMap.values()].map((bucket) => ({ label: bucket.label, value: Number(bucket.value.toFixed(2)) }));
+}
+
+function buildCarbonSummary(records, settings) {
+  const todayKey = indiaDateKey();
+  const monthKey = todayKey.slice(0, 7);
+  const summary = {
+    todayKey,
+    monthKey,
+    todayKg: 0,
+    monthToDateKg: 0,
+    totalKg: 0,
+    todayDistanceKm: 0,
+    monthToDateDistanceKm: 0,
+    totalDistanceKm: 0,
+    rateKgPerKm: Number(carbonRateVsCng(settings).toFixed(3)),
+  };
+  carbonSnapshotDailyTotals(records, settings).forEach((total, dayKey) => {
+    summary.totalKg += total.carbonKg;
+    summary.totalDistanceKm += total.distanceKm;
+    if (dayKey.startsWith(monthKey)) {
+      summary.monthToDateKg += total.carbonKg;
+      summary.monthToDateDistanceKm += total.distanceKm;
+    }
+    if (dayKey === todayKey) {
+      summary.todayKg += total.carbonKg;
+      summary.todayDistanceKm += total.distanceKm;
+    }
+  });
+  return Object.fromEntries(Object.entries(summary).map(([key, value]) => (
+    typeof value === 'number' ? [key, Number(value.toFixed(key === 'rateKgPerKm' ? 3 : 2))] : [key, value]
+  )));
+}
+
+function carbonSnapshotDailyTotals(records, settings) {
+  const latestByDayVehicle = new Map();
+  records.forEach((record) => {
+    const dayKey = indiaDateKey(record.scraped_at || record.last_updated || record.created_at);
+    const vehicle = vehicleKeyFromSnapshot(record);
+    if (!dayKey || !vehicle) return;
+    const key = `${dayKey}:${vehicle}`;
+    const previous = latestByDayVehicle.get(key);
+    if (carbonRecordTimeMs(record) >= carbonRecordTimeMs(previous)) latestByDayVehicle.set(key, record);
+  });
+  const totals = new Map();
+  latestByDayVehicle.forEach((record, key) => {
+    const dayKey = key.slice(0, 10);
+    const distanceKm = carbonDistanceFromSnapshot(record);
+    const carbonKg = carbonSavedVsCng(distanceKm, null, settings);
+    const total = totals.get(dayKey) || { distanceKm: 0, carbonKg: 0 };
+    total.distanceKm += distanceKm;
+    total.carbonKg += Number.isFinite(carbonKg) ? carbonKg : 0;
+    totals.set(dayKey, total);
+  });
+  return totals;
+}
+
+function carbonDistanceFromSnapshot(record = {}) {
+  const raw = objectValue(record.raw_payload) || {};
+  return numberFromTelemetry(firstValue(
+    record.distance_today_km,
+    record.today_distance,
+    raw['Dist._today'],
+    raw.distance_today_km,
+    raw.today_distance,
+    raw.distance_today,
+    raw.distance,
+  )) ?? 0;
+}
+
+function carbonRecordTimeMs(record = {}) {
+  const time = new Date(record?.scraped_at || record?.last_updated || record?.created_at || 0).getTime();
+  return Number.isFinite(time) ? time : 0;
 }
 
 function normalizeSettings(input = {}) {
@@ -1236,31 +1306,75 @@ function extractMapCoords(value) {
 }
 
 function trendStartDate(period) {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  if (period === 'year') {
-    date.setMonth(date.getMonth() - 11, 1);
-    return date;
-  }
-  date.setDate(date.getDate() - (period === 'month' ? 29 : 6));
-  return date;
+  const key = trendStartKey(period);
+  return period === 'year' ? indiaMonthStartUtc(key) : indiaDayStartUtc(key);
 }
 
 function trendBuckets(period) {
-  const start = trendStartDate(period);
-  const formatter = period === 'year'
-    ? new Intl.DateTimeFormat('en', { month: 'short' })
-    : new Intl.DateTimeFormat('en', { day: '2-digit', month: 'short' });
+  const startKey = trendStartKey(period);
   const count = period === 'year' ? 12 : period === 'month' ? 30 : 7;
   return Array.from({ length: count }, (_, index) => {
-    const date = new Date(start);
-    if (period === 'year') date.setMonth(start.getMonth() + index);
-    else date.setDate(start.getDate() + index);
+    const key = period === 'year' ? addMonthsToMonthKey(startKey, index) : addDaysToDateKey(startKey, index);
     return {
-      key: period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10),
-      label: formatter.format(date),
+      key,
+      label: carbonBucketLabel(key, period),
     };
   });
+}
+
+function trendStartKey(period) {
+  const todayKey = indiaDateKey();
+  if (period === 'year') return addMonthsToMonthKey(todayKey.slice(0, 7), -11);
+  return addDaysToDateKey(todayKey, -(period === 'month' ? 29 : 6));
+}
+
+function indiaDateKey(value) {
+  if (value === null || value === '') return '';
+  const source = value === undefined ? new Date() : value;
+  const date = source instanceof Date ? source : new Date(source);
+  if (Number.isNaN(date.getTime())) return '';
+  const indiaDate = new Date(date.getTime() + indiaOffsetMs);
+  return formatUtcDateKey(indiaDate);
+}
+
+function indiaDayStartUtc(key) {
+  const [year, month, day] = String(key || '').split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day) - indiaOffsetMs);
+}
+
+function indiaMonthStartUtc(key) {
+  const [year, month] = String(key || '').split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, 1) - indiaOffsetMs);
+}
+
+function addDaysToDateKey(key, offset) {
+  const [year, month, day] = String(key || '').split('-').map(Number);
+  return formatUtcDateKey(new Date(Date.UTC(year, month - 1, day + offset)));
+}
+
+function addMonthsToMonthKey(key, offset) {
+  const [year, month] = String(key || '').split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1 + offset, 1));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function formatUtcDateKey(date) {
+  return [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function carbonBucketLabel(key, period) {
+  const parts = String(key || '').split('-').map(Number);
+  const date = period === 'year'
+    ? new Date(Date.UTC(parts[0], parts[1] - 1, 1))
+    : new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+  const options = period === 'year'
+    ? { month: 'short', timeZone: 'UTC' }
+    : { day: '2-digit', month: 'short', timeZone: 'UTC' };
+  return new Intl.DateTimeFormat('en', options).format(date);
 }
 
 function carbonRateVsCng(settings) {

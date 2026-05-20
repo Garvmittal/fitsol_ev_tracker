@@ -34,6 +34,7 @@ const alertMinDistanceKm = Number(process.env.ALERT_MIN_DISTANCE_KM || 10);
 const cngConsumptionKgPerKm = Number(process.env.CNG_CONSUMPTION_KG_PER_KM || 0.18);
 const evEnergyKwhPerKm = Number(process.env.EV_ENERGY_KWH_PER_KM || 0.22);
 const assumedAverageSpeedKmph = 24;
+const indiaOffsetMs = 5.5 * 60 * 60 * 1000;
 const otpStore = new Map();
 const sessions = new Map();
 const useSupabase = process.env.USE_SUPABASE === 'true';
@@ -859,6 +860,17 @@ app.get('/api/carbon-trend', requirePermission('fleet'), async (request, respons
     response.json({ period, unit: 'kgCO2e', points: buildCarbonTrend(records, period, settings) });
   } catch (error) {
     response.status(500).json({ error: 'Unable to load carbon trend', message: error.message });
+  }
+});
+
+app.get('/api/carbon-summary', requirePermission('fleet'), async (request, response) => {
+  try {
+    const sheets = await getSheetsClient();
+    const settings = await getDashboardSettings(sheets);
+    const records = scopeRows(await getCarbonSummaryRecords(sheets), request.user);
+    response.json({ unit: 'kgCO2e', ...buildCarbonSummary(records, settings) });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to load carbon summary', message: error.message });
   }
 });
 
@@ -1821,54 +1833,173 @@ async function getCarbonTrendRecords(sheets, period) {
   return getFleetRecords(sheets);
 }
 
+async function getCarbonSummaryRecords(sheets) {
+  if (useSupabase) {
+    const db = (sheets && sheets.supabase) || supabaseModule.getClient();
+    try {
+      const { data, error } = await db
+        .from('vehicle_snapshots')
+        .select('*')
+        .order('scraped_at', { ascending: true })
+        .limit(50000);
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Supabase carbon summary fallback:', error.message || error);
+    }
+  }
+  return getFleetRecords(sheets);
+}
+
 function buildCarbonTrend(records, period, settings) {
   const buckets = trendBuckets(period);
   const bucketMap = new Map(buckets.map((bucket) => [bucket.key, { ...bucket, value: 0 }]));
-  for (const record of records) {
-    const dateValue = field(record, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'updated_at', 'created_at');
-    const date = new Date(dateValue || 0);
-    if (Number.isNaN(date.getTime())) continue;
-    const key = period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10);
+  carbonSnapshotDailyTotals(records, settings).forEach((total, dayKey) => {
+    const key = period === 'year' ? dayKey.slice(0, 7) : dayKey;
     const bucket = bucketMap.get(key);
-    if (!bucket) continue;
-    const directCarbon = optionalNumber(record, 'carbon', 'Carbon saved vs CNG', 'carbon_saved_kg');
-    const distance = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
-    const energy = optionalNumber(record, 'energy_today_kwh', 'energy consumed', 'energy') ?? 0;
-    const carbon = directCarbon ?? carbonSavedVsCng(distance, energy, settings);
-    if (Number.isFinite(carbon)) bucket.value += carbon;
-  }
+    if (bucket) bucket.value += total.carbonKg;
+  });
   return [...bucketMap.values()].map((bucket) => ({
     label: bucket.label,
     value: Number(bucket.value.toFixed(2)),
   }));
 }
 
-function trendStartDate(period) {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  if (period === 'year') {
-    date.setMonth(date.getMonth() - 11, 1);
-    return date;
+function buildCarbonSummary(records, settings) {
+  const todayKey = indiaDateKey();
+  const monthKey = todayKey.slice(0, 7);
+  const summary = {
+    todayKey,
+    monthKey,
+    todayKg: 0,
+    monthToDateKg: 0,
+    totalKg: 0,
+    todayDistanceKm: 0,
+    monthToDateDistanceKm: 0,
+    totalDistanceKm: 0,
+    rateKgPerKm: Number(carbonRateVsCng(settings).toFixed(3)),
+  };
+  carbonSnapshotDailyTotals(records, settings).forEach((total, dayKey) => {
+    summary.totalKg += total.carbonKg;
+    summary.totalDistanceKm += total.distanceKm;
+    if (dayKey.startsWith(monthKey)) {
+      summary.monthToDateKg += total.carbonKg;
+      summary.monthToDateDistanceKm += total.distanceKm;
+    }
+    if (dayKey === todayKey) {
+      summary.todayKg += total.carbonKg;
+      summary.todayDistanceKm += total.distanceKm;
+    }
+  });
+  return Object.fromEntries(Object.entries(summary).map(([key, value]) => (
+    typeof value === 'number' ? [key, Number(value.toFixed(key === 'rateKgPerKm' ? 3 : 2))] : [key, value]
+  )));
+}
+
+function carbonSnapshotDailyTotals(records, settings) {
+  const latestByDayVehicle = new Map();
+  for (const record of records) {
+    const dayKey = indiaDateKey(field(record, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'updated_at', 'created_at'));
+    const vehicle = vehicleIdFromRecord(record);
+    if (!dayKey || !vehicle) continue;
+    const key = `${dayKey}:${vehicle}`;
+    const previous = latestByDayVehicle.get(key);
+    if (carbonRecordTimeMs(record) >= carbonRecordTimeMs(previous)) latestByDayVehicle.set(key, record);
   }
-  date.setDate(date.getDate() - (period === 'month' ? 29 : 6));
-  return date;
+  const totals = new Map();
+  latestByDayVehicle.forEach((record, key) => {
+    const dayKey = key.slice(0, 10);
+    const distanceKm = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
+    const carbonKg = carbonSavedVsCng(distanceKm, null, settings);
+    const total = totals.get(dayKey) || { distanceKm: 0, carbonKg: 0 };
+    total.distanceKm += distanceKm;
+    total.carbonKg += Number.isFinite(carbonKg) ? carbonKg : 0;
+    totals.set(dayKey, total);
+  });
+  return totals;
+}
+
+function carbonRecordTimeMs(record = {}) {
+  const time = new Date(field(record, 'scraped_at', 'vehicle_updated_at', 'last_updated', 'updated_at', 'created_at') || 0).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+function trendStartDate(period) {
+  const key = trendStartKey(period);
+  return period === 'year' ? indiaMonthStartUtc(key) : indiaDayStartUtc(key);
 }
 
 function trendBuckets(period) {
-  const start = trendStartDate(period);
-  const formatter = period === 'year'
-    ? new Intl.DateTimeFormat('en', { month: 'short' })
-    : new Intl.DateTimeFormat('en', { day: '2-digit', month: 'short' });
+  const startKey = trendStartKey(period);
   const count = period === 'year' ? 12 : period === 'month' ? 30 : 7;
   return Array.from({ length: count }, (_, index) => {
-    const date = new Date(start);
-    if (period === 'year') date.setMonth(start.getMonth() + index);
-    else date.setDate(start.getDate() + index);
+    const key = period === 'year' ? addMonthsToMonthKey(startKey, index) : addDaysToDateKey(startKey, index);
     return {
-      key: period === 'year' ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 10),
-      label: formatter.format(date),
+      key,
+      label: carbonBucketLabel(key, period),
     };
   });
+}
+
+function trendStartKey(period) {
+  const todayKey = indiaDateKey();
+  if (period === 'year') return addMonthsToMonthKey(todayKey.slice(0, 7), -11);
+  return addDaysToDateKey(todayKey, -(period === 'month' ? 29 : 6));
+}
+
+function indiaDateKey(value) {
+  if (value === null || value === '') return '';
+  const source = value === undefined ? new Date() : value;
+  const date = source instanceof Date ? source : new Date(source);
+  if (Number.isNaN(date.getTime())) return '';
+  const indiaDate = new Date(date.getTime() + indiaOffsetMs);
+  return formatUtcDateKey(indiaDate);
+}
+
+function indiaDayStartUtc(key) {
+  const [year, month, day] = String(key || '').split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day) - indiaOffsetMs);
+}
+
+function indiaMonthStartUtc(key) {
+  const [year, month] = String(key || '').split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, 1) - indiaOffsetMs);
+}
+
+function addDaysToDateKey(key, offset) {
+  const [year, month, day] = String(key || '').split('-').map(Number);
+  return formatUtcDateKey(new Date(Date.UTC(year, month - 1, day + offset)));
+}
+
+function addMonthsToMonthKey(key, offset) {
+  const [year, month] = String(key || '').split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1 + offset, 1));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function formatUtcDateKey(date) {
+  return [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function carbonBucketLabel(key, period) {
+  const parts = String(key || '').split('-').map(Number);
+  const date = period === 'year'
+    ? new Date(Date.UTC(parts[0], parts[1] - 1, 1))
+    : new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+  const options = period === 'year'
+    ? { month: 'short', timeZone: 'UTC' }
+    : { day: '2-digit', month: 'short', timeZone: 'UTC' };
+  return new Intl.DateTimeFormat('en', options).format(date);
+}
+
+function carbonRateVsCng(settings) {
+  const cngEmissionsPerKm = settings.cngConsumption * settings.cngFactor;
+  const evEmissionsPerKm = settings.evEnergy * settings.electricityFactor;
+  return Math.max(0, cngEmissionsPerKm - evEmissionsPerKm);
 }
 
 async function getDashboardSettings(sheets) {

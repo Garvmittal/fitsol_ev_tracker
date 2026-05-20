@@ -1768,16 +1768,23 @@ function DriverConsole({ assignments, driverSession, setDriverSession }) {
 function Overview({ vehicles, tasks, clientHubs, parkings }) {
   const [trendPeriod, setTrendPeriod] = useState('week');
   const [carbonTrend, setCarbonTrend] = useState({ loading: true, points: [], error: '' });
+  const [carbonSummary, setCarbonSummary] = useState({ loading: true, error: '', todayKg: 0, monthToDateKg: 0, totalKg: 0, rateKgPerKm: 0 });
   const pending = tasks.filter((task) => task.status === 'Pending').length;
   const deployedVehicles = vehicles.filter(hasClientDeployment);
   const activeClientCount = new Set(deployedVehicles.map((vehicle) => normalizeClientName(vehicle.client)).filter(Boolean)).size;
   const activeVehicles = vehicles.filter((vehicle) => vehicle.status !== 'Offline').length;
   const offlineVehicles = vehicles.filter((vehicle) => vehicle.status === 'Offline').length;
-  const carbonSaved = vehicles.reduce((total, vehicle) => total + parseCarbonKg(vehicle.carbon), 0);
-  const distanceCovered = vehicles.reduce((total, vehicle) => total + numberFromValue(vehicle.todayDistance), 0);
-  const carbonPerKm = distanceCovered ? carbonSaved / distanceCovered : 0;
+  const carbonSavedToday = Number(carbonSummary.todayKg) || 0;
+  const carbonSavedMonth = Number(carbonSummary.monthToDateKg) || 0;
+  const carbonSavedTotal = Number(carbonSummary.totalKg) || 0;
+  const carbonPerKm = Number(carbonSummary.rateKgPerKm) || 0;
   const vehiclesAtParking = countVehiclesAtParking(vehicles, clientHubs, parkings);
   const trendPoints = carbonTrend.points;
+  const carbonMetric = (value) => {
+    if (carbonSummary.loading) return 'Loading...';
+    if (carbonSummary.error) return 'Unavailable';
+    return `${formatNumber(value)} kg`;
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1794,6 +1801,21 @@ function Overview({ vehicles, tasks, clientHubs, parkings }) {
     };
   }, [trendPeriod]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setCarbonSummary((current) => ({ ...current, loading: true, error: '' }));
+    apiJson('/api/carbon-summary')
+      .then((payload) => {
+        if (!cancelled) setCarbonSummary({ loading: false, error: '', ...payload });
+      })
+      .catch((error) => {
+        if (!cancelled) setCarbonSummary((current) => ({ ...current, loading: false, error: error.message || 'Unable to load carbon summary.' }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <section className="overview-workspace">
       <div className="overview-grid">
@@ -1803,8 +1825,10 @@ function Overview({ vehicles, tasks, clientHubs, parkings }) {
         <MetricCard icon={Zap} label="Vehicles active" value={activeVehicles} />
         <MetricCard icon={CircleAlert} label="Vehicles offline" value={offlineVehicles} />
         <MetricCard icon={MapPin} label="Vehicles at parking" value={vehiclesAtParking} />
-        <MetricCard icon={Gauge} label="Carbon saved today vs CNG" value={`${formatNumber(carbonSaved)} kg`} />
-        <MetricCard icon={Route} label="Carbon saved per km" value={`${formatNumber(carbonPerKm)} kg/km`} />
+        <MetricCard icon={Gauge} label="Carbon saved today vs CNG" value={carbonMetric(carbonSavedToday)} />
+        <MetricCard icon={Gauge} label="Carbon saved this month" value={carbonMetric(carbonSavedMonth)} />
+        <MetricCard icon={Gauge} label="Carbon saved till date" value={carbonMetric(carbonSavedTotal)} />
+        <MetricCard icon={Route} label="Carbon saved per km" value={carbonSummary.loading ? 'Loading...' : carbonSummary.error ? 'Unavailable' : `${formatNumber(carbonPerKm)} kg/km`} />
         <MetricCard icon={CircleAlert} label="Pending ops tasks" value={pending} />
       </div>
       <CarbonTrendPanel
@@ -2184,10 +2208,9 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
     let disposed = false;
     async function renderMarkers() {
       const markerLibrary = mapId ? await window.google.maps.importLibrary('marker') : null;
-      markersRef.current.forEach((marker) => {
-        if ('map' in marker) marker.map = null;
-        else marker.setMap(null);
-      });
+      if (disposed || !mapRef.current) return;
+      clearRenderedMapMarkers(markersRef.current);
+      markersRef.current = [];
       const renderedMarkers = mapMarkers
         .filter((marker) => marker.coords)
         .map((marker) => {
@@ -2219,6 +2242,10 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
             zIndex: markerZIndex(marker),
           });
         });
+      if (disposed) {
+        clearRenderedMapMarkers(renderedMarkers);
+        return;
+      }
       const selected = vehicles.find((vehicle) => vehicle.id === selectedId);
       markersRef.current = renderedMarkers;
       const focusCoords = [
@@ -2237,6 +2264,8 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
     renderMarkers();
     return () => {
       disposed = true;
+      clearRenderedMapMarkers(markersRef.current);
+      markersRef.current = [];
     };
   }, [vehicles, selectedId, setSelectedId, mapId, mapMarkers]);
 
@@ -2247,6 +2276,13 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
       <MapMarkerInfo marker={activeMarker} onClose={() => setActiveMarkerId('')} />
     </section>
   );
+}
+
+function clearRenderedMapMarkers(markers = []) {
+  markers.forEach((marker) => {
+    if ('map' in marker) marker.map = null;
+    else marker.setMap(null);
+  });
 }
 
 function MapMarkerInfo({ marker, onClose }) {
