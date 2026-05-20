@@ -30,7 +30,7 @@ const otpDevMode = process.env.OTP_DEV_MODE === 'true';
 const otpExpiryMinutes = Number(process.env.OTP_EXPIRY_MINUTES || 10);
 const sessionExpiryHours = Number(process.env.SESSION_EXPIRY_HOURS || 12);
 const alertMinRunningMinutes = Number(process.env.ALERT_MIN_RUNNING_MINUTES || 60);
-const alertMinDistanceKm = Number(process.env.ALERT_MIN_DISTANCE_KM || 1);
+const alertMinDistanceKm = Number(process.env.ALERT_MIN_DISTANCE_KM || 10);
 const cngConsumptionKgPerKm = Number(process.env.CNG_CONSUMPTION_KG_PER_KM || 0.18);
 const evEnergyKwhPerKm = Number(process.env.EV_ENERGY_KWH_PER_KM || 0.22);
 const assumedAverageSpeedKmph = 24;
@@ -392,6 +392,75 @@ app.post('/api/deployments', requirePermission('deployments'), async (request, r
     response.json({ ok: true, deployment: normalizeDeploymentRow(deployment), assignment, tasks });
   } catch (error) {
     response.status(500).json({ error: 'Unable to save deployment', message: error.message });
+  }
+});
+
+app.post('/api/deployments/update', requirePermission('deployments'), async (request, response) => {
+  try {
+    const vehicle = String(request.body?.vehicle || '').trim().toUpperCase();
+    const client = String(request.body?.client || '').trim();
+    const hub = String(request.body?.hub || '').trim();
+    const parking = String(request.body?.parking || '').trim();
+    const hubGmpLink = String(request.body?.hubGmpLink || '').trim();
+    const parkingGmpLink = String(request.body?.parkingGmpLink || '').trim();
+    const driverEmail = normalizeEmail(request.body?.driverEmail);
+    const driverName = String(request.body?.driverName || '').trim();
+    const hubCoords = coordsFromBody(request.body, 'hub') || extractMapCoords(hubGmpLink);
+    const parkingCoords = coordsFromBody(request.body, 'parking') || extractMapCoords(parkingGmpLink);
+
+    if (!vehicle || !client || !hub || !parking || !hubCoords || !parkingCoords) {
+      return response.status(400).json({ error: 'Vehicle, client, hub, and parking coordinates are required.' });
+    }
+    if (!canAccessClient(request.user, client)) return response.status(403).json({ error: 'You cannot update deployments for this client' });
+
+    const sheets = await getSheetsClient();
+    await ensureSheetWithHeaders(sheets, deploymentsSheetName, deploymentHeaders());
+    const rows = scopeRows(await getSheetRecords(sheets, deploymentsSheetName), request.user);
+    const current = latestByKey(
+      rows.filter((row) => (
+        String(row.vehicle || '').trim().toUpperCase() === vehicle
+        && normalizeClient(row.client) === normalizeClient(client)
+        && normalizeBoolean(row.status || 'Active')
+      )),
+      'vehicle',
+      'created_at',
+    ).get(vehicle);
+    if (!current?.deployment_id) return response.status(404).json({ error: 'No active deployment found for this vehicle and client' });
+
+    const patch = {
+      hub,
+      hub_gmp_link: hubGmpLink,
+      hub_lat: hubCoords.lat,
+      hub_lng: hubCoords.lng,
+      parking,
+      parking_gmp_link: parkingGmpLink,
+      parking_lat: parkingCoords.lat,
+      parking_lng: parkingCoords.lng,
+    };
+    const updated = await updateSheetRowById(
+      sheets,
+      deploymentsSheetName,
+      'deployment_id',
+      current.deployment_id,
+      patch,
+      (row) => canAccessClient(request.user, row.client),
+    );
+    const assignment = driverEmail
+      ? await createDeploymentDriverAssignment(sheets, {
+          vehicle,
+          client,
+          hub,
+          deployAt: current.deploy_at || current.created_at,
+          driverEmail,
+          driverName,
+          createdBy: request.user.email || request.user.name,
+          createdAt: new Date().toISOString(),
+        })
+      : null;
+
+    response.json({ ok: true, deployment: normalizeDeploymentRow(updated || { ...current, ...patch }), assignment });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to update deployment', message: error.message });
   }
 });
 
@@ -843,9 +912,10 @@ app.get('/api/alerts/preview', requirePermission('alerts'), async (request, resp
   try {
     const sheets = await getSheetsClient();
     const recipients = await getAlertRecipients(sheets);
-    const rawRecords = scopeRows(await getFleetRecords(sheets), request.user);
+    const deployments = alertDeploymentContext(await getLatestDeploymentsByVehicle(sheets), request.user);
+    const rawRecords = await getFleetRecords(sheets);
     const settings = await getDashboardSettings(sheets);
-    const alerts = buildMovementAlerts(rawRecords, settings);
+    const alerts = buildMovementAlerts(rawRecords, settings, deployments);
     response.json({
       recipients,
       alerts,
@@ -862,9 +932,10 @@ app.post('/api/alerts/send', requirePermission('alerts'), async (request, respon
     const sheets = await getSheetsClient();
     const recipients = await getAlertRecipients(sheets);
     const settings = await getDashboardSettings(sheets);
-    const alerts = buildMovementAlerts(scopeRows(await getFleetRecords(sheets), request.user), settings);
+    const deployments = alertDeploymentContext(await getLatestDeploymentsByVehicle(sheets), request.user);
+    const alerts = buildMovementAlerts(await getFleetRecords(sheets), settings, deployments);
     if (!recipients.length) return response.status(400).json({ error: 'No active alert recipients configured', setup: alertTabSetup() });
-    if (!alerts.length) return response.json({ ok: true, sent: 0, message: 'No vehicles breached movement thresholds.' });
+    if (!alerts.length) return response.json({ ok: true, sent: 0, message: 'No deployed vehicles breached the movement threshold.' });
     const subject = `EV movement alert: ${alerts.length} vehicle${alerts.length === 1 ? '' : 's'} need review`;
     const text = formatAlertEmail(alerts, settings);
     const delivery = await sendMail({ to: recipients.map((person) => person.email).join(','), subject, text });
@@ -1560,6 +1631,15 @@ async function getLatestDeploymentsByVehicle(sheets) {
   return latestByKey(rows.filter((row) => normalizeBoolean(row.status || 'Active')), 'vehicle', 'created_at');
 }
 
+function alertDeploymentContext(deploymentsByVehicle, user) {
+  const context = new Map();
+  deploymentsByVehicle.forEach((row, key) => {
+    if (!canAccessClient(user, row.client || row.Client || '')) return;
+    context.set(vehicleKey(row.vehicle || key), normalizeDeploymentRow(row));
+  });
+  return context;
+}
+
 async function getLatestAssignmentsByVehicle(sheets) {
   await ensureSheetWithHeaders(sheets, driverAssignmentsSheetName, driverAssignmentHeaders());
   const rows = await getSheetRecords(sheets, driverAssignmentsSheetName);
@@ -1940,12 +2020,13 @@ async function loadGoogleSheetRecords(sheets, sheetTitle) {
     .map((row) => Object.fromEntries(headers.map((header, index) => [String(header || '').trim(), row[index] ?? ''])));
 }
 
-function buildMovementAlerts(records, settings = defaultSettings()) {
+function buildMovementAlerts(records, settings = defaultSettings(), deploymentContext = new Map()) {
   const targetDate = previousDateKey();
   const latestByVehicle = new Map();
   for (const record of records) {
     const vehicle = vehicleIdFromRecord(record);
     if (!vehicle) continue;
+    if (!deploymentContext.has(vehicle)) continue;
     const recordDate = dateKey(field(record, 'vehicle_updated_at', 'last_updated', 'updated_at', 'scraped_at'));
     if (recordDate !== targetDate) continue;
     const currentTime = recordTimeMs(record);
@@ -1955,13 +2036,16 @@ function buildMovementAlerts(records, settings = defaultSettings()) {
   }
   return [...latestByVehicle.values()]
     .map((record) => {
+      const vehicle = vehicleIdFromRecord(record);
+      const deployment = deploymentContext.get(vehicle);
       const distance = optionalNumber(record, 'distance_today_km', 'today_distance', 'Dist._today', 'distance_today', 'distance') ?? 0;
       const runningMinutes = optionalNumber(record, 'today_running_minutes', 'time today', 'running_minutes') ?? 0;
       const reasons = [];
       if (distance < settings.minDistance) reasons.push(`distance ${distance} km < ${settings.minDistance} km`);
-      if (runningMinutes < settings.minRunTime) reasons.push(`running ${runningMinutes} min < ${settings.minRunTime} min`);
       return {
-        vehicle: vehicleIdFromRecord(record),
+        vehicle,
+        client: deployment?.client || '',
+        hub: deployment?.hub || '',
         sourceSystem: field(record, 'source_system', 'source') || 'Unknown',
         date: targetDate,
         distanceTodayKm: distance,
@@ -1978,12 +2062,14 @@ function buildMovementAlerts(records, settings = defaultSettings()) {
 
 function formatAlertEmail(alerts, settings = defaultSettings()) {
   return [
-    `Kyoto EV Fleet movement alert for ${previousDateKey()}`,
+    `Kyoto EV Fleet deployed-vehicle movement alert for ${previousDateKey()}`,
     '',
-    `Thresholds: less than ${settings.minDistance} km OR less than ${settings.minRunTime} running minutes.`,
+    `Threshold: deployed vehicle distance less than ${settings.minDistance} km.`,
     '',
     ...alerts.map((alert) => [
       `Vehicle: ${alert.vehicle}`,
+      `Client: ${alert.client || 'Unassigned'}`,
+      `Hub: ${alert.hub || 'Unassigned'}`,
       `Status: ${alert.status}`,
       `Distance: ${alert.distanceTodayKm} km`,
       `Running time: ${alert.runningMinutes} min`,

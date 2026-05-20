@@ -38,6 +38,7 @@ export async function supabaseApiJson(url, options = {}) {
   if (path === '/api/client-hubs' && method === 'GET') return getClientHubs(user);
   if (path === '/api/client-hubs' && method === 'POST') return saveClientHubs(body, user);
   if (path === '/api/deployments' && method === 'POST') return createDeployment(body, user);
+  if (path === '/api/deployments/update' && method === 'POST') return updateDeployment(body, user);
   if (path === '/api/deployments/remove' && method === 'POST') return removeDeployment(body, user);
   if (path === '/api/deployments/end' && method === 'POST') return scheduleDeploymentEnd(body, user);
   if (path === '/api/driver-assignments' && method === 'GET') return getDriverAssignments(user);
@@ -408,6 +409,54 @@ async function createDeployment(body, user) {
   return { ok: true, deployment: normalizeDeployment(deployment), assignment, tasks };
 }
 
+async function updateDeployment(body, user) {
+  requirePermission(user, 'deployments');
+  const vehicle = vehicleKey(body.vehicle);
+  const client = String(body.client || '').trim();
+  if (!vehicle || !client) throw new Error('Vehicle and client are required.');
+  if (!canAccessClient(user, client)) throw new Error('You cannot update deployments for this client.');
+  const { data: rows, error: readError } = await supabase
+    .from('deployments')
+    .select('*')
+    .eq('vehicle', vehicle)
+    .eq('client', client)
+    .neq('status', 'Removed')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (readError) throw readError;
+  const current = rows?.[0];
+  if (!current?.deployment_id && !current?.id) throw new Error('No active deployment found for this vehicle and client.');
+  const patch = {
+    hub: body.hub || current.hub || '',
+    hub_gmp_link: body.hubGmpLink || '',
+    hub_lat: numberOrNull(body.hubLat),
+    hub_lng: numberOrNull(body.hubLng),
+    parking: body.parking || current.parking || '',
+    parking_gmp_link: body.parkingGmpLink || '',
+    parking_lat: numberOrNull(body.parkingLat),
+    parking_lng: numberOrNull(body.parkingLng),
+  };
+  let query = supabase.from('deployments').update(patch);
+  query = current.deployment_id ? query.eq('deployment_id', current.deployment_id) : query.eq('id', current.id);
+  const { data, error } = await query.select().limit(1);
+  if (error) throw error;
+  const updated = data?.[0] || { ...current, ...patch };
+  const driverEmail = normalizeEmail(body.driverEmail);
+  const assignment = driverEmail
+    ? await createDeploymentDriverAssignment({
+        vehicle,
+        client,
+        hub: patch.hub,
+        deployAt: current.deploy_at || current.created_at,
+        driverEmail,
+        driverName: String(body.driverName || '').trim(),
+        user,
+        createdAt: new Date().toISOString(),
+      })
+    : null;
+  return { ok: true, deployment: normalizeDeployment(updated), assignment };
+}
+
 async function removeDeployment(body, user) {
   requirePermission(user, 'deployments');
   const vehicle = String(body.vehicle || '').trim().toUpperCase();
@@ -611,9 +660,13 @@ async function getCarbonTrend(periodValue) {
 async function getAlertPreview(user) {
   requirePermission(user, 'alerts');
   const { settings } = await getSettings();
-  const { data, error } = await supabase.from('vehicle_snapshots').select('*').order('scraped_at', { ascending: false }).limit(1000);
+  const [{ data, error }, deployments] = await Promise.all([
+    supabase.from('vehicle_snapshots').select('*').order('scraped_at', { ascending: false }).limit(1000),
+    listRows('deployments', 'created_at', false),
+  ]);
   if (error) throw error;
-  return { alerts: buildMovementAlerts(data || [], settings), setupNeeded: false };
+  const latestDeployments = latestByKey((deployments || []).filter((row) => row.status !== 'Removed'), 'vehicle', 'created_at');
+  return { alerts: buildMovementAlerts(data || [], settings, alertDeploymentContext(latestDeployments, user)), setupNeeded: false };
 }
 
 async function sendAlertsDryRun(user) {
@@ -906,17 +959,42 @@ function parseLocationLines(value) {
     .filter((item) => item.name || item.gmpLink);
 }
 
-function buildMovementAlerts(records, settings) {
+function alertDeploymentContext(deploymentsByVehicle, user) {
+  const context = new Map();
+  deploymentsByVehicle.forEach((row, key) => {
+    if (!canAccess(user, 'all') && user?.client && normalizeText(row.client) !== normalizeText(user.client)) return;
+    context.set(vehicleKey(row.vehicle || key), row);
+  });
+  return context;
+}
+
+function vehicleKeyFromSnapshot(record) {
+  return vehicleKey(record.vehicle_number || record.Vehcile_no || record.vehicle_no || record.vehicle || record.vehicle_id || record.id);
+}
+
+function buildMovementAlerts(records, settings, deploymentContext = new Map()) {
   const targetDate = previousDateKey();
-  const latestByVehicle = latestByKey(records.filter((row) => dateKey(row.scraped_at || row.last_updated || row.updated_at) === targetDate), 'vehicle_id', 'scraped_at');
+  const latestByVehicle = new Map();
+  records.forEach((record) => {
+    const vehicle = vehicleKeyFromSnapshot(record);
+    if (!vehicle || !deploymentContext.has(vehicle)) return;
+    if (dateKey(record.scraped_at || record.last_updated || record.updated_at) !== targetDate) return;
+    const currentTime = new Date(record.scraped_at || record.last_updated || record.updated_at || 0).getTime() || 0;
+    const previous = latestByVehicle.get(vehicle);
+    const previousTime = previous ? new Date(previous.scraped_at || previous.last_updated || previous.updated_at || 0).getTime() || 0 : -1;
+    if (currentTime >= previousTime) latestByVehicle.set(vehicle, record);
+  });
   return [...latestByVehicle.values()].map((record) => {
+    const vehicle = vehicleKeyFromSnapshot(record);
+    const deployment = deploymentContext.get(vehicle);
     const distance = numberFromTelemetry(record.distance_today_km ?? record.today_distance) ?? 0;
     const runningMinutes = minutesFromTelemetry(record.today_running_minutes) ?? 0;
     const reasons = [];
     if (distance < settings.minDistance) reasons.push(`distance ${distance} km < ${settings.minDistance} km`);
-    if (runningMinutes < settings.minRunTime) reasons.push(`running ${runningMinutes} min < ${settings.minRunTime} min`);
     return {
-      vehicle: record.vehicle_id || record.vehicle_number || '',
+      vehicle,
+      client: deployment?.client || '',
+      hub: deployment?.hub || '',
       sourceSystem: record.source || 'Unknown',
       date: targetDate,
       distanceTodayKm: distance,
@@ -962,7 +1040,7 @@ function buildCarbonTrend(records, period, settings) {
 function normalizeSettings(input = {}) {
   const defaults = {
     goodCharge: 70,
-    minDistance: 1,
+    minDistance: 10,
     minRunTime: 10,
     electricityFactor: 0.72,
     cngFactor: 2.75,

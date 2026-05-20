@@ -239,7 +239,7 @@ function App() {
   const [driverSession, setDriverSession] = useState('Ready');
   const [settingsState, setSettingsState] = useState({
     goodCharge: 70,
-    minDistance: 1,
+    minDistance: 10,
     minRunTime: 10,
     electricityFactor: 0.72,
     cngFactor: 2.75,
@@ -677,6 +677,7 @@ function App() {
       if (assignment?.name) {
         deployment.driverState = assignment.sessionState === 'Active session' ? 'active' : 'assigned';
         deployment.driver = assignment.name;
+        deployment.driverEmail = assignment.email || deployment.driverEmail;
         deployment.driverMeta = `${assignment.status || 'Assigned'} - ${assignment.shift || 'Deployment default'}`;
       }
     } catch (error) {
@@ -701,6 +702,55 @@ function App() {
     setToast('Existing Sheet vehicle assigned to client hub.');
     window.setTimeout(() => setToast(''), 2600);
     return true;
+  }
+
+  async function updateDeployment(data) {
+    const vehicleId = String(data.vehicle || '').trim().toUpperCase();
+    if (!vehicleId || !data.client || !data.hub || !data.parking) {
+      setToast('Choose hub, parking, and vehicle.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
+    try {
+      const payload = await apiJson('/api/deployments/update', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
+      const assignment = payload.assignment || null;
+      if (assignment?.vehicle) setDriverAssignments((current) => [assignment, ...current]);
+      setVehicles((current) => current.map((vehicle) => {
+        if (vehicle.id !== vehicleId) return vehicle;
+        const next = {
+          ...vehicle,
+          hub: data.hub,
+          hubGmpLink: data.hubGmpLink || '',
+          hubLat: data.hubLat,
+          hubLng: data.hubLng,
+          parking: data.parking,
+          parkingGmpLink: data.parkingGmpLink || '',
+          parkingLat: data.parkingLat,
+          parkingLng: data.parkingLng,
+          route: data.hub ? `${data.hub} deployment route` : vehicle.route,
+          lastStop: data.parking || vehicle.lastStop,
+          lastUpdated: 'just now',
+        };
+        next.locationState = locationStateFor(next, next);
+        if (assignment?.name) {
+          next.driverState = assignment.sessionState === 'Active session' ? 'active' : 'assigned';
+          next.driver = assignment.name;
+          next.driverEmail = assignment.email || '';
+          next.driverMeta = `${assignment.status || 'Assigned'} - ${assignment.shift || 'Deployment default'}`;
+        }
+        return next;
+      }));
+      setToast('Deployment updated.');
+      window.setTimeout(() => setToast(''), 2600);
+      return true;
+    } catch (error) {
+      setToast(error.message || 'Unable to update deployment.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
   }
 
   async function removeDeployment(event) {
@@ -1012,6 +1062,7 @@ function App() {
 	            addDriver={addDriver}
 	            drivers={drivers}
 	            driverAssignments={driverAssignments}
+	            vehicles={vehicles}
 	            updateDriverPhone={updateDriverPhone}
 	          />
 	        )}
@@ -1039,6 +1090,7 @@ function App() {
             parkings={parkings}
             addParkingSite={addParkingSite}
             scheduleDeploymentEnd={scheduleDeploymentEnd}
+            updateDeployment={updateDeployment}
           />
         )}
         {activeTab === 'Admin' && (
@@ -1128,9 +1180,11 @@ function OperationsHub({
   tasks,
   vehicles,
   scheduleDeploymentEnd,
+  updateDeployment,
 }) {
   const [deployOpen, setDeployOpen] = useState(false);
   const [endTarget, setEndTarget] = useState(null);
+  const [editTarget, setEditTarget] = useState(null);
   const [clientModalOpen, setClientModalOpen] = useState(false);
   const [parkingModalOpen, setParkingModalOpen] = useState(false);
   const [driverModalOpen, setDriverModalOpen] = useState(false);
@@ -1154,12 +1208,15 @@ function OperationsHub({
   const tableRows = useMemo(() => deployed.map((vehicle) => {
     const assignment = latestAssignmentByVehicle.get(vehicle.id);
     const scheduled = scheduledEnds.get(vehicle.id);
+    const fallbackDriver = safeValue(vehicle.driver, '');
     return {
       vehicle,
       assignment,
       scheduled,
       defaultDriver: safeValue(vehicle.driver, 'Not set'),
-      currentDriver: assignment?.name ? `${assignment.name}${assignment.email ? ` (${assignment.email})` : ''}` : 'Not assigned',
+      currentDriver: assignment?.name
+        ? `${assignment.name}${assignment.email ? ` (${assignment.email})` : ''}`
+        : fallbackDriver && fallbackDriver !== 'No driver confirmed yet' ? fallbackDriver : 'Not assigned',
     };
   }), [deployed, latestAssignmentByVehicle, scheduledEnds]);
 
@@ -1230,6 +1287,9 @@ function OperationsHub({
                       : <span className="status-pill success">Active</span>}
                   </td>
                   <td className="ops-action-col">
+                    <button className="ghost-action compact-action" type="button" onClick={() => setEditTarget(vehicle)} title="Edit deployment">
+                      <Pencil size={17} />
+                    </button>
                     <button className="primary-action compact-action danger" type="button" onClick={() => setEndTarget(vehicle)}>
                       <X size={17} /> End
                     </button>
@@ -1263,6 +1323,22 @@ function OperationsHub({
         />
       )}
 
+      {editTarget && (
+        <EditDeploymentModal
+          vehicle={editTarget}
+          clientHubs={clientHubs}
+          parkings={parkings}
+          drivers={drivers}
+          closeModal={() => setEditTarget(null)}
+          onOpenAddParking={() => setParkingModalOpen(true)}
+          onOpenAddDriver={() => setDriverModalOpen(true)}
+          updateDeployment={async (payload) => {
+            const ok = await updateDeployment(payload);
+            if (ok) setEditTarget(null);
+          }}
+        />
+      )}
+
       {endTarget && (
         <EndDeploymentModal
           vehicle={endTarget}
@@ -1282,6 +1358,103 @@ function OperationsHub({
       {parkingModalOpen && <ParkingOnboardingModal addParkingSite={async (data) => { const result = await addParkingSite(data); if (result?.ok) setParkingModalOpen(false); return result; }} closeModal={() => setParkingModalOpen(false)} />}
       {driverModalOpen && <DriverOnboardingModal addDriver={async (event) => { const ok = await addDriver(event); if (ok) setDriverModalOpen(false); }} closeModal={() => setDriverModalOpen(false)} />}
     </section>
+  );
+}
+
+function EditDeploymentModal({ vehicle, clientHubs, parkings, drivers, closeModal, onOpenAddParking, onOpenAddDriver, updateDeployment }) {
+  const clientRecord = clientHubs.find((item) => normalizeClientName(item.client) === normalizeClientName(vehicle.client));
+  const hubs = normalizeLocationRecords(clientRecord?.hubs);
+  const clientParkings = normalizeLocationRecords(clientRecord?.parkings);
+  const globalParkings = Array.isArray(parkings) ? parkings.map((p) => ({
+    name: p.name,
+    gmpLink: p.gmpLink || '',
+    lat: p.lat,
+    lng: p.lng,
+  })) : [];
+  const combinedParkings = [...clientParkings, ...globalParkings];
+  const [hub, setHub] = useState(vehicle.hub || hubs[0]?.name || '');
+  const [parking, setParking] = useState(vehicle.parking || combinedParkings[0]?.name || '');
+  const [driverEmail, setDriverEmail] = useState('');
+
+  useEffect(() => {
+    if (hubs.length && !hubs.some((item) => item.name === hub)) setHub(hubs[0].name);
+  }, [hubs, hub]);
+
+  useEffect(() => {
+    if (combinedParkings.length && !combinedParkings.some((item) => item.name === parking)) setParking(combinedParkings[0].name);
+  }, [combinedParkings, parking]);
+
+  const selectedHub = hubs.find((item) => item.name === hub);
+  const selectedParking = combinedParkings.find((item) => item.name === parking);
+  const selectedDriver = (drivers || []).find((driver) => normalizeClientName(driver.email) === normalizeClientName(driverEmail));
+  const driverOptions = useMemo(() => (drivers || []).map((driver) => ({
+    id: driver.driverId || driver.id || driver.email,
+    email: driver.email,
+    label: `${driver.name}${driver.phone ? ` - ${driver.phone}` : ''}`,
+  })), [drivers]);
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    const hubCoords = coordsFromFields(selectedHub?.lat, selectedHub?.lng) || extractMapCoords(selectedHub?.gmpLink);
+    const parkingCoords = coordsFromFields(selectedParking?.lat, selectedParking?.lng) || extractMapCoords(selectedParking?.gmpLink);
+    if (!selectedHub || !hubCoords || !selectedParking || !parkingCoords) return;
+    await updateDeployment({
+      vehicle: vehicle.id,
+      client: vehicle.client,
+      hub,
+      hubGmpLink: selectedHub.gmpLink || '',
+      hubLat: hubCoords.lat,
+      hubLng: hubCoords.lng,
+      parking,
+      parkingGmpLink: selectedParking.gmpLink || '',
+      parkingLat: parkingCoords.lat,
+      parkingLng: parkingCoords.lng,
+      driverEmail,
+      driverName: selectedDriver?.name || '',
+    });
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="modal-card client-hub-form add-client-modal ops-deploy-modal" onSubmit={handleSubmit}>
+        <div className="panel-title">
+          <div>
+            <span>Active deployment</span>
+            <h2>Edit {vehicle.id}</h2>
+          </div>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
+        </div>
+        <div className="ops-form-row">
+          <label>Vehicle<input value={vehicle.id} readOnly /></label>
+          <label>Client<input value={vehicle.client} readOnly /></label>
+        </div>
+        <label>Hub<select value={hub} onChange={(event) => setHub(event.target.value)} required>{hubs.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+        {combinedParkings.length ? (
+          <div className="ops-form-row">
+            <label>Parking<select value={parking} onChange={(event) => setParking(event.target.value)} required>{combinedParkings.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+            <button className="ghost-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={16} /> Add parking</button>
+          </div>
+        ) : (
+          <div className="empty-location">
+            <strong>Parking not found</strong>
+            <button className="primary-action compact-action" type="button" onClick={onOpenAddParking}><Plus size={18} /> Add parking</button>
+          </div>
+        )}
+        <div className="ops-form-row">
+          <label>Driver
+            <select value={driverEmail} onChange={(event) => setDriverEmail(event.target.value)}>
+              <option value="">Keep current driver</option>
+              {driverOptions.map((driver) => <option key={driver.id} value={driver.email}>{driver.label}</option>)}
+            </select>
+          </label>
+          <button className="ghost-action compact-action" type="button" onClick={onOpenAddDriver}><Plus size={16} /> Add driver</button>
+        </div>
+        <div className="modal-actions">
+          <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
+          <button className="primary-action" type="submit"><Check size={18} /> Save changes</button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -2465,14 +2638,12 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
     if (!q) return clientHubs;
     return clientHubs.filter((client) => {
       const hubs = normalizeLocationRecords(client.hubs).map((h) => `${h.name} ${h.gmpLink}`).join(' ');
-      const parkings = normalizeLocationRecords(client.parkings).map((p) => `${p.name} ${p.gmpLink}`).join(' ');
       const deployedCount = vehicles.filter((vehicle) => normalizeClientName(vehicle.client) === normalizeClientName(client.client) && hasClientDeployment(vehicle)).length;
       const haystack = [
         client.client,
         client.gstNumber,
         client.clientPoc,
         hubs,
-        parkings,
         String(deployedCount),
       ].join(' ').toLowerCase();
       return haystack.includes(q);
@@ -2530,7 +2701,6 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
                 <th>GST number</th>
                 <th>Client POC</th>
                 <th>Hubs</th>
-                <th>Parking points</th>
                 <th>Vehicles deployed</th>
                 <th />
               </tr>
@@ -2538,7 +2708,6 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
             <tbody>
               {filteredClients.map((client) => {
                 const hubs = normalizeLocationRecords(client.hubs);
-                const parkings = normalizeLocationRecords(client.parkings);
                 const deployedCount = vehicles.filter((vehicle) => normalizeClientName(vehicle.client) === normalizeClientName(client.client) && hasClientDeployment(vehicle)).length;
                 return (
                   <tr key={client.client}>
@@ -2546,10 +2715,9 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
                     <td>{safeValue(client.gstNumber, 'Not added')}</td>
                     <td>{safeValue(client.clientPoc, 'Not added')}</td>
                     <td><button className="ghost-action" type="button" onClick={() => openClientHubs(client)}>{hubs.length}</button></td>
-                    <td>{parkings.length}</td>
                     <td>{deployedCount}</td>
                     <td>
-                      <button className="ghost-action compact-action" type="button" onClick={() => openClientHubs(client)} title="Edit client hubs/parking">
+                      <button className="ghost-action compact-action" type="button" onClick={() => openClientHubs(client)} title="Edit client hubs">
                         <Pencil size={17} />
                       </button>
                     </td>
@@ -2587,19 +2755,6 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
                   {!normalizeLocationRecords(viewingClient.hubs).length && <span className="empty-location">No hubs added yet.</span>}
                 </div>
               </div>
-              <div className="hub-modal-section">
-                <strong>Parkings</strong>
-                <div className="location-list">
-                  {normalizeLocationRecords(viewingClient.parkings).map((p) => (
-                    <a className="location-link" key={p.name} href={p.gmpLink} target="_blank" rel="noreferrer">
-                      <MapPin size={17} />
-                      <span>{p.name}</span>
-                      <ExternalLink size={15} />
-                    </a>
-                  ))}
-                  {!normalizeLocationRecords(viewingClient.parkings).length && <span className="empty-location">No parking points added yet.</span>}
-                </div>
-              </div>
               <form onSubmit={addHubForClient} className="hub-modal-form">
                 <label>New hub name<input value={newHubName} onChange={(e) => setNewHubName(e.target.value)} required /></label>
                 <label>Google Maps link<input value={newHubLink} onChange={(e) => setNewHubLink(e.target.value)} placeholder="https://maps.google.com/..." /></label>
@@ -2617,7 +2772,7 @@ function ClientsHub({ addClient, refreshClientHubs, clientHubs, vehicles }) {
   );
 }
 
-function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDriverPhone }) {
+function DriversHub({ addDriver, drivers = [], driverAssignments = [], vehicles = [], updateDriverPhone }) {
   const [driverModalOpen, setDriverModalOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [editPhone, setEditPhone] = useState('');
@@ -2641,8 +2796,16 @@ function DriversHub({ addDriver, drivers = [], driverAssignments = [], updateDri
       const active = session.includes('active') || status.includes('started') || status.includes('assigned');
       map.set(email, active ? assignment.vehicle : '');
     });
+    drivers.forEach((driver) => {
+      const email = normalizeClientName(driver.email);
+      if (!email || map.get(email)) return;
+      const byEmail = vehicles.find((vehicle) => normalizeClientName(vehicle.driverEmail || '') === email && hasClientDeployment(vehicle));
+      const byName = vehicles.find((vehicle) => normalizeClientName(vehicle.driver || '') === normalizeClientName(driver.name) && hasClientDeployment(vehicle));
+      const vehicle = byEmail || byName;
+      if (vehicle?.id) map.set(email, vehicle.id);
+    });
     return map;
-  }, [driverAssignments]);
+  }, [driverAssignments, drivers, vehicles]);
 
   function beginEdit(driver) {
     setEditing(driver);
@@ -2752,15 +2915,6 @@ function ParkingHub({ parkings = [], vehicles = [], addParkingSite }) {
   const [parkingModalOpen, setParkingModalOpen] = useState(false);
   const [parkingQuery, setParkingQuery] = useState('');
 
-  const filtered = useMemo(() => {
-    const q = parkingQuery.trim().toLowerCase();
-    if (!q) return parkings;
-    return parkings.filter((p) => {
-      const haystack = [p.name, p.location, p.gmpLink].join(' ').toLowerCase();
-      return haystack.includes(q);
-    });
-  }, [parkings, parkingQuery]);
-
   const parkedCountBySite = useMemo(() => {
     const map = new Map();
     (parkings || []).forEach((p) => {
@@ -2780,6 +2934,40 @@ function ParkingHub({ parkings = [], vehicles = [], addParkingSite }) {
     });
     return map;
   }, [parkings, vehicles]);
+
+  const deployedCountBySite = useMemo(() => {
+    const map = new Map();
+    (parkings || []).forEach((p) => {
+      const key = p.parkingId || p.id || p.name;
+      const siteName = normalizeMapScopeName(p.name);
+      const siteCoords = coordsFromFields(p.lat, p.lng) || extractMapCoords(p.gmpLink);
+      const count = (vehicles || []).filter((vehicle) => {
+        if (!hasClientDeployment(vehicle)) return false;
+        const sameName = siteName && normalizeMapScopeName(vehicle.parking) === siteName;
+        const vehicleParkingCoords = parkingCoordsFor(vehicle);
+        const sameCoords = siteCoords && vehicleParkingCoords && distanceMeters(siteCoords, vehicleParkingCoords) <= 100;
+        return sameName || sameCoords;
+      }).length;
+      if (key) map.set(key, count);
+    });
+    return map;
+  }, [parkings, vehicles]);
+
+  const filtered = useMemo(() => {
+    const q = parkingQuery.trim().toLowerCase();
+    if (!q) return parkings;
+    return parkings.filter((p) => {
+      const siteKey = p.parkingId || p.id || p.name;
+      const haystack = [
+        p.name,
+        p.location,
+        p.gmpLink,
+        String(parkedCountBySite.get(siteKey) ?? 0),
+        String(deployedCountBySite.get(siteKey) ?? 0),
+      ].join(' ').toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [parkings, parkingQuery, parkedCountBySite, deployedCountBySite]);
 
   return (
     <section className="table-panel">
@@ -2801,7 +2989,8 @@ function ParkingHub({ parkings = [], vehicles = [], addParkingSite }) {
               <tr>
                 <th>Name</th>
                 <th>Location</th>
-                <th>Vehicles parked</th>
+                <th>Parked now</th>
+                <th>Total deployed</th>
               </tr>
             </thead>
             <tbody>
@@ -2816,6 +3005,7 @@ function ParkingHub({ parkings = [], vehicles = [], addParkingSite }) {
                     )}
                   </td>
                   <td>{parkedCountBySite.get(p.parkingId || p.id || p.name) ?? 0}</td>
+                  <td>{deployedCountBySite.get(p.parkingId || p.id || p.name) ?? 0}</td>
                 </tr>
               ))}
             </tbody>
@@ -3005,12 +3195,11 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
         <div className="hub-directory">
           {clientHubs.map((item) => {
             const clientHubsList = normalizeLocationRecords(item.hubs);
-            const parkingList = normalizeLocationRecords(item.parkings);
             return (
               <article key={item.client}>
                 <strong>{item.client}</strong>
                 <span>GST: {safeValue(item.gstNumber, 'Not added')} | POC: {safeValue(item.clientPoc, 'Not added')}</span>
-                <span>{clientHubsList.length} hubs | {parkingList.length} parking points</span>
+                <span>{clientHubsList.length} hubs</span>
               </article>
             );
           })}
@@ -3032,13 +3221,9 @@ function Deployments({ addClient, addDeployment, removeDeployment, removeDeploym
 function ClientOnboardingModal({ addClient, closeModal }) {
   const [poc, setPoc] = useState({ name: '', email: '', phone: '' });
   const [hubs, setHubs] = useState([{ name: '', gmpLink: '' }]);
-  const [parkings, setParkings] = useState([]);
 
   const updateHub = (index, patch) => setHubs((current) => current.map((hub, itemIndex) => (itemIndex === index ? { ...hub, ...patch } : hub)));
-  const updateParking = (index, patch) => setParkings((current) => current.map((parking, itemIndex) => (itemIndex === index ? { ...parking, ...patch } : parking)));
-  const removeParking = (index) => setParkings((current) => current.filter((_, itemIndex) => itemIndex !== index));
   const hubPayload = hubs.map((hub) => `${hub.name.trim()} | ${normalizeMapLink(hub.gmpLink)}`).join('\n');
-  const parkingPayload = parkings.map((parking) => `${parking.name.trim()} | ${normalizeMapLink(parking.gmpLink)}`).join('\n');
   const pocPayload = [poc.name, poc.email, poc.phone].map((value) => value.trim()).filter(Boolean).join(' | ');
 
   return (
@@ -3053,11 +3238,11 @@ function ClientOnboardingModal({ addClient, closeModal }) {
         <div className="poc-grid">
           <label>POC name<input name="pocName" value={poc.name} onChange={(event) => setPoc((current) => ({ ...current, name: event.target.value }))} placeholder="Contact person" required /></label>
           <label>POC email<input name="pocEmail" value={poc.email} onChange={(event) => setPoc((current) => ({ ...current, email: event.target.value }))} type="email" placeholder="name@company.com" required /></label>
-          <label>POC phone<input name="pocPhone" value={poc.phone} onChange={(event) => setPoc((current) => ({ ...current, phone: event.target.value }))} type="tel" placeholder="+91 98765 43210" pattern="[0-9+()\\-\\s]{7,20}" required /></label>
+          <label>POC phone<input name="pocPhone" value={poc.phone} onChange={(event) => setPoc((current) => ({ ...current, phone: event.target.value }))} type="tel" placeholder="+91 98765 XXXXX" pattern="[0-9+()\\-\\s]{7,20}" required /></label>
         </div>
         <input type="hidden" name="clientPoc" value={pocPayload} readOnly />
         <input type="hidden" name="hubs" value={hubPayload} />
-        <input type="hidden" name="parkings" value={parkingPayload} />
+        <input type="hidden" name="parkings" value="" />
         <div className="location-editor">
           <div className="location-editor-title">
             <strong>Hubs</strong>
@@ -3073,23 +3258,6 @@ function ClientOnboardingModal({ addClient, closeModal }) {
               onRemove={() => setHubs((current) => current.filter((_, itemIndex) => itemIndex !== index))}
             />
           ))}
-        </div>
-        <div className="location-editor">
-          <div className="location-editor-title">
-            <strong>Parking</strong>
-            <button className="ghost-action compact-action" type="button" onClick={() => setParkings((current) => [...current, { name: '', gmpLink: '' }])}><Plus size={16} /> Add parking</button>
-          </div>
-          {parkings.map((parking, index) => (
-            <LocationEditorCard
-              key={`parking-${index}`}
-              item={parking}
-              label="Parking"
-              onChange={(patch) => updateParking(index, patch)}
-              canRemove
-              onRemove={() => removeParking(index)}
-            />
-          ))}
-          {!parkings.length && <div className="empty-location">Parking is optional.</div>}
         </div>
         <div className="modal-actions">
           <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
@@ -3286,7 +3454,7 @@ function AlertsPanel() {
       <div className="panel-title">
         <div>
           <h2>Movement Alert Emails</h2>
-          <p>Vehicles are flagged when previous-day distance is low or running time is below 60 minutes.</p>
+          <p>Deployed vehicles are flagged when previous-day distance is below the configured km threshold.</p>
         </div>
         <div className="task-actions">
           <button type="button" onClick={loadPreview}><RefreshCw size={17} /> Preview</button>
@@ -3301,8 +3469,8 @@ function AlertsPanel() {
         <MetricMini icon={Calendar} label="Alert date" value={state.previousDate || 'Previous day'} />
       </div>
       <DataTable
-        columns={['Vehicle', 'Status', 'Distance', 'Running time', 'Battery', 'Reason', 'Last updated']}
-        rows={state.alerts.map((alert) => [alert.vehicle, alert.status, `${alert.distanceTodayKm} km`, `${alert.runningMinutes} min`, `${alert.batteryPercent}%`, alert.reasons.join('; '), alert.lastUpdated])}
+        columns={['Vehicle', 'Client', 'Hub', 'Status', 'Distance', 'Running time', 'Battery', 'Reason', 'Last updated']}
+        rows={state.alerts.map((alert) => [alert.vehicle, alert.client || 'Unassigned', alert.hub || 'Unassigned', alert.status, `${alert.distanceTodayKm} km`, `${alert.runningMinutes} min`, `${alert.batteryPercent}%`, alert.reasons.join('; '), alert.lastUpdated])}
       />
     </section>
   );
@@ -3325,8 +3493,8 @@ function SettingsPanel({ settingsState, saveSettings }) {
       <div className="wide-panel">
         <h2>Configured Outcome</h2>
         <div className="summary-list">
-          <span>Vehicles above {settingsState.goodCharge}% charge and below {settingsState.minDistance} km movement are eligible for unused-vehicle alerts.</span>
-          <span>Running time below {settingsState.minRunTime} minutes is treated as no meaningful movement.</span>
+          <span>Deployed vehicles below {settingsState.minDistance} km movement are eligible for unused-vehicle alerts.</span>
+          <span>Running time is shown in alert details, but distance is the trigger.</span>
           <span>Carbon savings compare EV electricity against CNG: electricity {settingsState.electricityFactor} kgCO2e/kWh, EV fallback {settingsState.evEnergy} kWh/km, CNG {settingsState.cngFactor} kgCO2e/kg, consumption {settingsState.cngConsumption} kg/km.</span>
         </div>
       </div>
