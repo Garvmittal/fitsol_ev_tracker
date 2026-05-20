@@ -2145,10 +2145,12 @@ function FleetMap({ vehicles, selectedId, setSelectedId, mapConfig, parkings = [
               aria-label={marker.title}
               aria-pressed={marker.kind === 'vehicle' ? marker.selected : undefined}
               className={className}
+              data-vehicle-id={marker.kind === 'vehicle' ? marker.vehicleId : undefined}
               key={marker.id}
               style={{ left: `${point.x}%`, top: `${point.y}%`, '--marker-color': markerColor(marker) }}
               type="button"
               onClick={() => {
+                if (marker.vehicleId) syncSelectedVehicleMarkerDom(marker.vehicleId);
                 if (marker.vehicleId) setSelectedId(marker.vehicleId);
                 setActiveMarkerId(marker.id);
               }}
@@ -2181,6 +2183,10 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
   const [activeMarkerId, setActiveMarkerId] = useState('');
   const mapMarkers = useMemo(() => buildMapMarkers(vehicles, selectedId, parkings, clientHubs), [vehicles, selectedId, parkings, clientHubs]);
   const activeMarker = mapMarkers.find((marker) => marker.id === activeMarkerId);
+
+  useEffect(() => {
+    syncSelectedVehicleMarkerDom(selectedId);
+  }, [selectedId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2224,6 +2230,7 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
               zIndex: markerZIndex(marker),
             });
             gmMarker.addListener('click', () => {
+              syncSelectedVehicleMarkerDom(marker.vehicleId);
               if (marker.vehicleId) setSelectedId(marker.vehicleId);
               setActiveMarkerId(marker.id);
             });
@@ -2231,6 +2238,7 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
           }
           const markerNode = dotMarkerNodeFor(marker);
           markerNode.addEventListener('click', () => {
+            syncSelectedVehicleMarkerDom(marker.vehicleId);
             if (marker.vehicleId) setSelectedId(marker.vehicleId);
             setActiveMarkerId(marker.id);
           });
@@ -2248,6 +2256,7 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
       }
       const selected = vehicles.find((vehicle) => vehicle.id === selectedId);
       markersRef.current = renderedMarkers;
+      syncSelectedVehicleMarkerDom(selectedId);
       const focusCoords = [
         vehicleCoordsFor(selected),
         hubCoordsFor(selected),
@@ -2282,6 +2291,16 @@ function clearRenderedMapMarkers(markers = []) {
   markers.forEach((marker) => {
     if ('map' in marker) marker.map = null;
     else marker.setMap(null);
+  });
+}
+
+function syncSelectedVehicleMarkerDom(selectedId) {
+  const selectedKey = String(selectedId || '').trim().toUpperCase();
+  document.querySelectorAll('.vehicle-marker-button').forEach((node) => {
+    const nodeKey = String(node.getAttribute('data-vehicle-id') || '').trim().toUpperCase();
+    const isSelected = Boolean(selectedKey && nodeKey === selectedKey);
+    node.classList.toggle('active', isSelected);
+    node.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
   });
 }
 
@@ -2338,6 +2357,7 @@ function vehicleMarkerNodeFor(marker) {
   markerNode.title = marker.title;
   markerNode.setAttribute('aria-label', marker.title);
   markerNode.setAttribute('aria-pressed', marker.selected ? 'true' : 'false');
+  markerNode.setAttribute('data-vehicle-id', marker.vehicleId || '');
   markerNode.style.setProperty('--marker-color', markerColor(marker));
   markerNode.innerHTML = vehicleMarkerGlyphHtml(marker.vehicleId);
   return markerNode;
@@ -2461,8 +2481,8 @@ function buildMapMarkers(vehicles, selectedId, globalParkings = [], clientHubs =
         ['Parking', safeValue(vehicle.parking, 'Parking unavailable')],
       ],
     });
-    addLocationMarker(markers, vehicle, 'hub', selected, hubKeys);
-    addLocationMarker(markers, vehicle, 'parking', selected);
+    addLocationMarker(markers, vehicle, 'hub', false, hubKeys);
+    addLocationMarker(markers, vehicle, 'parking', false);
   });
   (clientHubs || []).forEach((client) => {
     normalizeLocationRecords(client.hubs).forEach((hub, index) => {
