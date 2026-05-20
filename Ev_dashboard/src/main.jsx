@@ -2112,19 +2112,26 @@ function FleetMap({ vehicles, selectedId, setSelectedId, mapConfig, parkings = [
         {mapMarkers.map((marker) => {
           const point = previewPointForMarker(marker);
           if (!point) return null;
+          const className = [
+            marker.selected ? `map-dot ${marker.kind} active` : `map-dot ${marker.kind}`,
+            marker.kind === 'vehicle' ? 'vehicle-marker-button' : '',
+          ].filter(Boolean).join(' ');
           return (
             <button
               aria-label={marker.title}
-              className={marker.selected ? `map-dot ${marker.kind} active` : `map-dot ${marker.kind}`}
+              aria-pressed={marker.kind === 'vehicle' ? marker.selected : undefined}
+              className={className}
               key={marker.id}
-              style={{ left: `${point.x}%`, top: `${point.y}%` }}
+              style={{ left: `${point.x}%`, top: `${point.y}%`, '--marker-color': markerColor(marker) }}
               type="button"
               onClick={() => {
                 if (marker.vehicleId) setSelectedId(marker.vehicleId);
                 setActiveMarkerId(marker.id);
               }}
               title={marker.title}
-            />
+            >
+              {marker.kind === 'vehicle' ? <VehicleMarkerGlyph vehicleId={marker.vehicleId} /> : null}
+            </button>
           );
         })}
         <MapMarkerInfo marker={activeMarker} onClose={() => setActiveMarkerId('')} />
@@ -2276,6 +2283,7 @@ function loadGoogleMaps(apiKey) {
 }
 
 function dotMarkerNodeFor(marker) {
+  if (marker.kind === 'vehicle') return vehicleMarkerNodeFor(marker);
   const markerNode = document.createElement('button');
   markerNode.className = marker.selected ? `google-marker-dot ${marker.kind} active` : `google-marker-dot ${marker.kind}`;
   markerNode.type = 'button';
@@ -2285,7 +2293,74 @@ function dotMarkerNodeFor(marker) {
   return markerNode;
 }
 
+function vehicleMarkerNodeFor(marker) {
+  const markerNode = document.createElement('button');
+  markerNode.className = marker.selected
+    ? 'google-marker-dot vehicle vehicle-marker-button active'
+    : 'google-marker-dot vehicle vehicle-marker-button';
+  markerNode.type = 'button';
+  markerNode.title = marker.title;
+  markerNode.setAttribute('aria-label', marker.title);
+  markerNode.setAttribute('aria-pressed', marker.selected ? 'true' : 'false');
+  markerNode.style.setProperty('--marker-color', markerColor(marker));
+  markerNode.innerHTML = vehicleMarkerGlyphHtml(marker.vehicleId);
+  return markerNode;
+}
+
+function VehicleMarkerGlyph({ vehicleId }) {
+  return (
+    <span className="vehicle-marker-glyph" aria-hidden="true">
+      <span className="vehicle-marker-halo" />
+      <span className="vehicle-marker-shadow" />
+      <span className="vehicle-marker-body">
+        <span className="vehicle-marker-window front" />
+        <span className="vehicle-marker-window rear" />
+        <span className="vehicle-marker-hood" />
+        <span className="vehicle-marker-wheel front-left" />
+        <span className="vehicle-marker-wheel front-right" />
+        <span className="vehicle-marker-wheel rear-left" />
+        <span className="vehicle-marker-wheel rear-right" />
+      </span>
+      <span className="vehicle-marker-label">{shortVehicleLabel(vehicleId)}</span>
+    </span>
+  );
+}
+
+function vehicleMarkerGlyphHtml(vehicleId) {
+  return `
+    <span class="vehicle-marker-glyph" aria-hidden="true">
+      <span class="vehicle-marker-halo"></span>
+      <span class="vehicle-marker-shadow"></span>
+      <span class="vehicle-marker-body">
+        <span class="vehicle-marker-window front"></span>
+        <span class="vehicle-marker-window rear"></span>
+        <span class="vehicle-marker-hood"></span>
+        <span class="vehicle-marker-wheel front-left"></span>
+        <span class="vehicle-marker-wheel front-right"></span>
+        <span class="vehicle-marker-wheel rear-left"></span>
+        <span class="vehicle-marker-wheel rear-right"></span>
+      </span>
+      <span class="vehicle-marker-label">${escapeHtml(shortVehicleLabel(vehicleId))}</span>
+    </span>
+  `;
+}
+
+function shortVehicleLabel(vehicleId) {
+  const text = String(vehicleId || '').trim().toUpperCase();
+  return text.length > 4 ? text.slice(-4) : text;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function googleDotIcon(fill, selected = false, kind = 'vehicle') {
+  if (kind === 'vehicle') return googleVehicleIcon(fill, selected);
   const size = selected ? 30 : 24;
   const glyph = mapMarkerSvg(kind);
   const svg = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
@@ -2297,6 +2372,34 @@ function googleDotIcon(fill, selected = false, kind = 'vehicle') {
     url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
     scaledSize: new window.google.maps.Size(size, size),
     anchor: new window.google.maps.Point(size / 2, size / 2),
+  };
+}
+
+function googleVehicleIcon(fill, selected = false) {
+  const width = selected ? 58 : 48;
+  const height = selected ? 44 : 36;
+  const halo = selected ? '<ellipse cx="32" cy="24" rx="28" ry="19" fill="#00a060" opacity="0.22"/><ellipse cx="32" cy="24" rx="24" ry="16" fill="none" stroke="#00a060" stroke-width="3"/>' : '';
+  const svg = `<svg viewBox="0 0 64 48" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="body" x1="18" x2="46" y1="10" y2="36" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#ffd15a"/>
+        <stop offset="0.52" stop-color="${fill}"/>
+        <stop offset="1" stop-color="#b96f00"/>
+      </linearGradient>
+    </defs>
+    ${halo}
+    <ellipse cx="32" cy="37" rx="20" ry="6" fill="#111827" opacity="0.2"/>
+    <rect x="16" y="14" width="32" height="22" rx="8" fill="url(#body)" stroke="#ffffff" stroke-width="2"/>
+    <path d="M24 15h16l4 6H20l4-6Z" fill="#fff8df" opacity="0.55"/>
+    <rect x="24" y="20" width="16" height="9" rx="4" fill="#ffffff" opacity="0.82"/>
+    <rect x="20" y="18" width="4" height="14" rx="2" fill="#111827"/>
+    <rect x="40" y="18" width="4" height="14" rx="2" fill="#111827"/>
+    <path d="M26 31h12" stroke="#ffffff" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+  </svg>`;
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
+    scaledSize: new window.google.maps.Size(width, height),
+    anchor: new window.google.maps.Point(width / 2, height / 2),
   };
 }
 
@@ -2448,8 +2551,10 @@ function mapMarkerSvg(kind) {
 }
 
 function markerZIndex(marker) {
-  if (marker.selected) return 40;
-  if (marker.kind === 'vehicle') return 30;
+  if (marker.kind === 'vehicle' && marker.selected) return 100;
+  if (marker.selected) return 60;
+  if (marker.kind === 'vehicle') return 50;
+  if (marker.kind === 'hub') return 30;
   return 20;
 }
 
