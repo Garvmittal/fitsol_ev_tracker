@@ -662,15 +662,22 @@ async function getCarbonSummary() {
 }
 
 async function listCarbonSnapshots(startIso = '') {
-  let request = supabase
-    .from('vehicle_snapshots')
-    .select('id,vehicle_id,vehicle_number,scraped_at,created_at,distance_today_km,raw_payload')
-    .order('scraped_at', { ascending: true })
-    .limit(50000);
-  if (startIso) request = request.gte('scraped_at', startIso);
-  const { data, error } = await request;
-  if (error) throw error;
-  return data || [];
+  const pageSize = 1000;
+  const rows = [];
+  for (let from = 0; from < 100000; from += pageSize) {
+    let request = supabase
+      .from('vehicle_snapshots')
+      .select('id,vehicle_id,vehicle_number,scraped_at,created_at,distance_today_km,raw_payload')
+      .order('scraped_at', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (startIso) request = request.gte('scraped_at', startIso);
+    // eslint-disable-next-line no-await-in-loop
+    const { data, error } = await request;
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return rows;
 }
 
 async function getAlertPreview(user) {

@@ -2289,8 +2289,8 @@ function RealGoogleMap({ apiKey, mapId, vehicles, selectedId, setSelectedId, par
 
 function clearRenderedMapMarkers(markers = []) {
   markers.forEach((marker) => {
-    if ('map' in marker) marker.map = null;
-    else marker.setMap(null);
+    if (typeof marker.setMap === 'function') marker.setMap(null);
+    else if ('map' in marker) marker.map = null;
   });
 }
 

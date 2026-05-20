@@ -1819,13 +1819,7 @@ async function getCarbonTrendRecords(sheets, period) {
     const db = (sheets && sheets.supabase) || supabaseModule.getClient();
     const start = trendStartDate(period).toISOString();
     try {
-      const { data, error } = await db
-        .from('vehicle_snapshots')
-        .select('*')
-        .gte('scraped_at', start)
-        .order('scraped_at', { ascending: true });
-      if (error) throw error;
-      return data || [];
+      return await listSupabaseCarbonSnapshots(db, start);
     } catch (error) {
       console.error('Supabase carbon trend fallback:', error.message || error);
     }
@@ -1837,18 +1831,31 @@ async function getCarbonSummaryRecords(sheets) {
   if (useSupabase) {
     const db = (sheets && sheets.supabase) || supabaseModule.getClient();
     try {
-      const { data, error } = await db
-        .from('vehicle_snapshots')
-        .select('*')
-        .order('scraped_at', { ascending: true })
-        .limit(50000);
-      if (error) throw error;
-      return data || [];
+      return await listSupabaseCarbonSnapshots(db);
     } catch (error) {
       console.error('Supabase carbon summary fallback:', error.message || error);
     }
   }
   return getFleetRecords(sheets);
+}
+
+async function listSupabaseCarbonSnapshots(db, startIso = '') {
+  const pageSize = 1000;
+  const rows = [];
+  for (let from = 0; from < 100000; from += pageSize) {
+    let request = db
+      .from('vehicle_snapshots')
+      .select('*')
+      .order('scraped_at', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (startIso) request = request.gte('scraped_at', startIso);
+    // eslint-disable-next-line no-await-in-loop
+    const { data, error } = await request;
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return rows;
 }
 
 function buildCarbonTrend(records, period, settings) {
