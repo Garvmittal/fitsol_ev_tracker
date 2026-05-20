@@ -664,7 +664,7 @@ async function getCarbonSummary() {
 async function listCarbonSnapshots(startIso = '') {
   let request = supabase
     .from('vehicle_snapshots')
-    .select('id,vehicle_id,vehicle_number,scraped_at,created_at,distance_today_km,today_distance,raw_payload')
+    .select('id,vehicle_id,vehicle_number,scraped_at,created_at,distance_today_km,raw_payload')
     .order('scraped_at', { ascending: true })
     .limit(50000);
   if (startIso) request = request.gte('scraped_at', startIso);
