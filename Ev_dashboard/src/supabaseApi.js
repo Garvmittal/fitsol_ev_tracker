@@ -480,18 +480,100 @@ async function removeDeployment(body, user) {
 
 async function scheduleDeploymentEnd(body, user) {
   requirePermission(user, 'deployments');
+  const vehicle = vehicleKey(body.vehicle);
+  const replacementVehicle = vehicleKey(body.replacementVehicle);
+  const effectiveAt = String(body.effectiveAt || '').trim();
+  const parking = String(body.parking || '').trim();
+  const reason = String(body.reason || 'Scheduled undeploy').trim();
+  if (!vehicle || !effectiveAt || !parking) throw new Error('Vehicle, effective time, and parking are required.');
+
+  const { data: rows, error: readError } = await supabase
+    .from('deployments')
+    .select('*')
+    .eq('vehicle', vehicle)
+    .neq('status', 'Removed')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (readError) throw readError;
+  const activeDeployment = rows?.[0];
+  if (!activeDeployment) throw new Error('No active client deployment found for this vehicle.');
+  if (!canAccessClient(user, activeDeployment.client)) throw new Error('You cannot update deployments for this client.');
+
+  if (replacementVehicle) {
+    if (replacementVehicle === vehicle) throw new Error('Replacement vehicle must be different from the current vehicle.');
+    const { data: replacementRows, error: replacementReadError } = await supabase
+      .from('deployments')
+      .select('deployment_id,id,vehicle,status')
+      .eq('vehicle', replacementVehicle)
+      .neq('status', 'Removed')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (replacementReadError) throw replacementReadError;
+    if (replacementRows?.length) throw new Error('Replacement vehicle is already deployed.');
+  }
+
+  const patch = {
+    status: 'Ending',
+    removed_by: user.email,
+    removed_at: effectiveAt,
+    remove_reason: reason,
+  };
+  let updateQuery = supabase.from('deployments').update(patch);
+  updateQuery = activeDeployment.deployment_id
+    ? updateQuery.eq('deployment_id', activeDeployment.deployment_id)
+    : updateQuery.eq('id', activeDeployment.id);
+  const { data: updatedRows, error: updateError } = await updateQuery.select().limit(1);
+  if (updateError) throw updateError;
+  const updated = updatedRows?.[0] || { ...activeDeployment, ...patch };
+
+  let replacementDeployment = null;
+  if (replacementVehicle) {
+    const createdAt = new Date().toISOString();
+    replacementDeployment = {
+      deployment_id: cryptoRandomId(),
+      vehicle: replacementVehicle,
+      client: activeDeployment.client || '',
+      hub: activeDeployment.hub || '',
+      hub_gmp_link: activeDeployment.hub_gmp_link || '',
+      hub_lat: activeDeployment.hub_lat ?? null,
+      hub_lng: activeDeployment.hub_lng ?? null,
+      parking: activeDeployment.parking || '',
+      parking_gmp_link: activeDeployment.parking_gmp_link || '',
+      parking_lat: activeDeployment.parking_lat ?? null,
+      parking_lng: activeDeployment.parking_lng ?? null,
+      previous_undeploy_at: '',
+      deploy_at: effectiveAt,
+      layover_parking: '',
+      layover_parking_gmp_link: '',
+      layover_parking_lat: null,
+      layover_parking_lng: null,
+      usage: `Replacement for ${vehicle}`,
+      poc: activeDeployment.poc || '',
+      status: new Date(effectiveAt).getTime() > Date.now() ? 'Scheduled' : 'Active',
+      created_by: user.email,
+      created_at: createdAt,
+    };
+    const { error: insertError } = await supabase.from('deployments').insert(replacementDeployment);
+    if (insertError) throw insertError;
+  }
+
   const task = await createOpsTask({
-    title: 'End deployment and move vehicle',
-    vehicle: body.vehicle || '',
-    client: '',
-    hub: '',
-    parking: body.parking || '',
-    poc: body.driverChoice || '',
-    due: body.effectiveAt || '',
-    reason: body.reason || 'Scheduled undeploy',
+    title: replacementVehicle ? `Replace ${vehicle} with ${replacementVehicle}` : 'End deployment and move vehicle',
+    vehicle,
+    client: activeDeployment.client || '',
+    hub: activeDeployment.hub || '',
+    parking,
+    poc: activeDeployment.poc || '',
+    due: effectiveAt,
+    reason,
     status: 'Pending',
   }, user);
-  return { ok: true, task };
+  return {
+    ok: true,
+    deployment: normalizeDeployment(updated),
+    replacementDeployment: replacementDeployment ? normalizeDeployment(replacementDeployment) : null,
+    task,
+  };
 }
 
 async function getDriverAssignments(user) {
@@ -721,7 +803,6 @@ async function createDeploymentTasks(deployment, user) {
   const titles = [
     'Confirm deployment details with client POC',
     'Park vehicle at assigned parking',
-    'Assign driver and confirm shift start',
     deployment.layover_parking && deployment.layover_parking !== deployment.parking ? `Confirm layover parking readiness (${deployment.layover_parking})` : '',
     deployment.previous_undeploy_at ? 'End previous deployment and log undeploy time' : '',
   ].filter(Boolean);
@@ -1147,6 +1228,11 @@ function canAccess(user, permission) {
   if (permissions.includes('all')) return true;
   if (Array.isArray(permission)) return permission.some((item) => canAccess(user, item));
   return permissions.includes(permission);
+}
+
+function canAccessClient(user, client) {
+  if (canAccess(user, 'all') || !user?.client) return true;
+  return normalizeText(user.client) === normalizeText(client);
 }
 
 function permissionsForRole(role) {

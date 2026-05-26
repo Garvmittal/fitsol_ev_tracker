@@ -219,13 +219,14 @@ h1 {
   align-items: end;
   display: grid;
   gap: clamp(12px, 1.1vw, 20px);
-  grid-template-columns: minmax(260px, 0.9fr) minmax(260px, 1fr) auto;
+  grid-template-columns: minmax(420px, max-content) minmax(260px, 1fr) auto;
   margin-bottom: clamp(18px, 1.7vw, 28px);
 }
 
 .status-toggle {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
 }
 

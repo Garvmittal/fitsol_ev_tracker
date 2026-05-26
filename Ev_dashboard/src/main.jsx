@@ -849,6 +849,29 @@ function App() {
         body: JSON.stringify({ vehicle, reason, effectiveAt, parking, replacementVehicle }),
       });
       if (payload.task) setTasks((current) => [payload.task, ...current]);
+      if (replacementVehicle) {
+        const sourceVehicle = vehicles.find((item) => item.id === vehicle);
+        if (sourceVehicle) {
+          setVehicles((current) => current.map((item) => (
+            item.id === replacementVehicle
+              ? {
+                  ...item,
+                  client: sourceVehicle.client,
+                  hub: sourceVehicle.hub,
+                  hubGmpLink: sourceVehicle.hubGmpLink,
+                  hubLat: sourceVehicle.hubLat,
+                  hubLng: sourceVehicle.hubLng,
+                  parking: sourceVehicle.parking,
+                  parkingGmpLink: sourceVehicle.parkingGmpLink,
+                  parkingLat: sourceVehicle.parkingLat,
+                  parkingLng: sourceVehicle.parkingLng,
+                  locationState: 'Replacement deployment scheduled',
+                  lastUpdated: 'just now',
+                }
+              : item
+          )));
+        }
+      }
       setToast(replacementVehicle ? 'Replacement scheduled with undeploy task.' : 'Undeploy scheduled and task created.');
       window.setTimeout(() => setToast(''), 2400);
       return { vehicle, reason, effectiveAt, parking, replacementVehicle };
@@ -1034,7 +1057,7 @@ function App() {
         </div>
 
         {toast && <div className="toast">{toast}</div>}
-        {activeTab === 'Overview' && <Overview vehicles={vehicles} tasks={tasks} clientHubs={clientHubs} parkings={parkings} />}
+        {activeTab === 'Overview' && <Overview vehicles={vehicles} clientHubs={clientHubs} parkings={parkings} />}
 	        {activeTab === 'EV Fleet' && (
 	          <FleetView
 	            filteredVehicles={filteredVehicles}
@@ -1085,10 +1108,8 @@ function App() {
             drivers={drivers}
             addDriver={addDriver}
             addDeployment={addDeployment}
-            markTaskDone={markTaskDone}
             openFleet={() => setActiveTab('EV Fleet')}
             selectVehicle={setSelectedId}
-            tasks={tasks}
             vehicles={vehicles}
             parkings={parkings}
             addParkingSite={addParkingSite}
@@ -1246,7 +1267,7 @@ function OperationsHub({
       <div className="panel-title">
         <div className="panel-title-stack">
           <h2>Operations</h2>
-          <p className="form-note">Manage deployments and ops tasks without breaking the workflow.</p>
+          <p className="form-note">Manage deployments, edits, and replacements without breaking the workflow.</p>
         </div>
         <button className="primary-action compact-action" type="button" onClick={() => setDeployOpen(true)}>
           <Plus size={18} /> Deploy vehicle
@@ -1256,7 +1277,7 @@ function OperationsHub({
       <div className="table-panel ops-deployments-panel">
         <div className="panel-title">
           <div>
-            <h3>Active Deployments</h3>
+            <h3>Current Deployments</h3>
             <p className="form-note">{deployed.length} deployed vehicle(s)</p>
           </div>
           <button className="ghost-action compact-action" type="button" onClick={openFleet}><MapPin size={17} /> View fleet</button>
@@ -1639,28 +1660,40 @@ function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeploy
   );
 }
 
-function EndDeploymentModal({ vehicle, vehicles, parkings, drivers = [], closeModal, onOpenAddParking, scheduleEnd }) {
+function EndDeploymentModal({ vehicle, vehicles, parkings, closeModal, onOpenAddParking, scheduleEnd }) {
   const [reason, setReason] = useState(endDeploymentReasons[0]);
   const [customReason, setCustomReason] = useState('');
   const [effectiveAt, setEffectiveAt] = useState(new Date(Date.now() + 15 * 60 * 1000).toISOString().slice(0, 16));
   const [parking, setParking] = useState(parkings?.[0]?.name || '');
   const [replacementVehicle, setReplacementVehicle] = useState('');
 
-  const driverOptions = useMemo(() => (drivers || []).map((d) => ({ id: d.driverId || d.id, label: `${d.name}${d.phone ? ` • ${d.phone}` : ''}`, email: d.email })), [drivers]);
+  const replacementOptions = useMemo(() => (vehicles || [])
+    .filter((item) => item.id !== vehicle.id && vehicleFleetGroup(item) === 'Not deployed')
+    .sort((a, b) => a.id.localeCompare(b.id)), [vehicles, vehicle.id]);
 
   useEffect(() => {
     if (!parkings?.some((p) => p.name === parking)) setParking(parkings?.[0]?.name || '');
   }, [parkings, parking]);
 
+  useEffect(() => {
+    if (reason !== 'Replacement') {
+      setReplacementVehicle('');
+      return;
+    }
+    if (!replacementOptions.some((item) => item.id === replacementVehicle)) {
+      setReplacementVehicle(replacementOptions[0]?.id || '');
+    }
+  }, [reason, replacementOptions, replacementVehicle]);
+
   async function submit(event) {
     event.preventDefault();
-    const choice = useDefaultDriver ? `Default (${safeValue(vehicle.driver, 'Not set')})` : (driverEmail || 'Unspecified');
+    const finalReason = reason === 'Other' ? customReason.trim() : reason;
     await scheduleEnd({
       vehicle: vehicle.id,
-      reason,
+      reason: finalReason,
       effectiveAt: new Date(effectiveAt).toISOString(),
       parking,
-      driverChoice: choice,
+      replacementVehicle: reason === 'Replacement' ? replacementVehicle : '',
     });
   }
 
@@ -1672,7 +1705,10 @@ function EndDeploymentModal({ vehicle, vehicles, parkings, drivers = [], closeMo
           <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
         </div>
         <label>Vehicle<input value={`${vehicle.id} • ${safeValue(vehicle.client, '')}`} readOnly /></label>
-        <label>Reason<input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Completed, returned, reassigned..." required /></label>
+        <label>Reason<select value={reason} onChange={(e) => setReason(e.target.value)} required>{endDeploymentReasons.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+        {reason === 'Other' && (
+          <label>Reason details<input value={customReason} onChange={(e) => setCustomReason(e.target.value)} placeholder="Add reason details" required /></label>
+        )}
         <label>Undeploy effective from<input type="datetime-local" value={effectiveAt} onChange={(e) => setEffectiveAt(e.target.value)} required /></label>
 
         {parkings?.length ? (
@@ -1687,27 +1723,20 @@ function EndDeploymentModal({ vehicle, vehicles, parkings, drivers = [], closeMo
           </div>
         )}
 
-        <div className="ops-driver-choice">
-          <div className="ops-driver-choice-title"><strong>Driver for this ops task</strong></div>
-          <label className="checkbox-line">
-            <input type="radio" name="driverChoice" checked={useDefaultDriver} onChange={() => setUseDefaultDriver(true)} />
-            <span>Use default driver ({safeValue(vehicle.driver, 'Not set')})</span>
-          </label>
-          <label className="checkbox-line">
-            <input type="radio" name="driverChoice" checked={!useDefaultDriver} onChange={() => setUseDefaultDriver(false)} />
-            <span>Assign a different driver</span>
-          </label>
-          {!useDefaultDriver && (
-            <div className="ops-form-row">
-              <label>Driver<select value={driverEmail} onChange={(e) => setDriverEmail(e.target.value)} required>{driverOptions.map((d) => <option key={d.id} value={d.email}>{d.label}</option>)}</select></label>
-              <button className="ghost-action compact-action" type="button" onClick={onOpenAddDriver}><Plus size={16} /> Add driver</button>
+        {reason === 'Replacement' && (
+          replacementOptions.length ? (
+            <label>Replacement vehicle<select value={replacementVehicle} onChange={(e) => setReplacementVehicle(e.target.value)} required>{replacementOptions.map((item) => <option key={item.id} value={item.id}>{item.id} - {safeValue(item.model, 'Vehicle')}</option>)}</select></label>
+          ) : (
+            <div className="empty-location">
+              <strong>No available replacement vehicles</strong>
+              <span className="form-note">Only communicating vehicles that are not already deployed can be selected.</span>
             </div>
-          )}
-        </div>
+          )
+        )}
 
         <div className="modal-actions">
           <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
-          <button className="primary-action danger" type="submit"><Check size={18} /> Schedule undeploy</button>
+          <button className="primary-action danger" type="submit" disabled={reason === 'Replacement' && !replacementVehicle}><Check size={18} /> Schedule undeploy</button>
         </div>
       </form>
     </div>
@@ -1768,15 +1797,14 @@ function DriverConsole({ assignments, driverSession, setDriverSession }) {
   );
 }
 
-function Overview({ vehicles, tasks, clientHubs, parkings }) {
+function Overview({ vehicles, clientHubs, parkings }) {
   const [trendPeriod, setTrendPeriod] = useState('week');
   const [carbonTrend, setCarbonTrend] = useState({ loading: true, points: [], error: '' });
   const [carbonSummary, setCarbonSummary] = useState({ loading: true, error: '', todayKg: 0, monthToDateKg: 0, totalKg: 0, rateKgPerKm: 0 });
-  const pending = tasks.filter((task) => task.status === 'Pending').length;
   const deployedVehicles = vehicles.filter(hasClientDeployment);
   const activeClientCount = new Set(deployedVehicles.map((vehicle) => normalizeClientName(vehicle.client)).filter(Boolean)).size;
-  const activeVehicles = vehicles.filter((vehicle) => vehicle.status !== 'Offline').length;
-  const offlineVehicles = vehicles.filter((vehicle) => vehicle.status === 'Offline').length;
+  const notDeployedVehicles = vehicles.filter((vehicle) => vehicleFleetGroup(vehicle) === 'Not deployed').length;
+  const notInUseVehicles = vehicles.filter((vehicle) => vehicleFleetGroup(vehicle) === 'Not in use').length;
   const carbonSavedToday = Number(carbonSummary.todayKg) || 0;
   const carbonSavedMonth = Number(carbonSummary.monthToDateKg) || 0;
   const carbonSavedTotal = Number(carbonSummary.totalKg) || 0;
@@ -1825,14 +1853,13 @@ function Overview({ vehicles, tasks, clientHubs, parkings }) {
         <MetricCard icon={UsersRound} label="Onboarded clients" value={clientHubs.length} />
         <MetricCard icon={UsersRound} label="Active clients" value={activeClientCount} />
         <MetricCard icon={Truck} label="Vehicles deployed" value={deployedVehicles.length} />
-        <MetricCard icon={Zap} label="Vehicles active" value={activeVehicles} />
-        <MetricCard icon={CircleAlert} label="Vehicles offline" value={offlineVehicles} />
+        <MetricCard icon={Zap} label="Vehicles not deployed" value={notDeployedVehicles} />
+        <MetricCard icon={CircleAlert} label="Vehicles not in use" value={notInUseVehicles} />
         <MetricCard icon={MapPin} label="Vehicles at parking" value={vehiclesAtParking} />
         <MetricCard icon={Gauge} label="Carbon saved today vs CNG" value={carbonMetric(carbonSavedToday)} />
         <MetricCard icon={Gauge} label="Carbon saved this month" value={carbonMetric(carbonSavedMonth)} />
         <MetricCard icon={Gauge} label="Carbon saved till date" value={carbonMetric(carbonSavedTotal)} />
         <MetricCard icon={Route} label="Carbon saved per km" value={carbonSummary.loading ? 'Loading...' : carbonSummary.error ? 'Unavailable' : `${formatNumber(carbonPerKm)} kg/km`} />
-        <MetricCard icon={CircleAlert} label="Pending ops tasks" value={pending} />
       </div>
       <CarbonTrendPanel
         period={trendPeriod}
@@ -3538,7 +3565,7 @@ function OpsActionCenter({ tasks, markTaskDone, selectVehicle, openFleet }) {
   return (
     <section className="table-panel">
       <div className="panel-title">
-        <h2>Ops Action Center</h2>
+        <h2>Deployment Tasks</h2>
         <span>{tasks.filter((task) => task.status === 'Pending').length} pending</span>
       </div>
       <div className="task-list">
@@ -4013,8 +4040,8 @@ function canScheduleVehicleForDeployment(vehicle) {
 function deploymentStatusLabel(vehicle) {
   if (!vehicle) return 'No vehicle selected';
   if (hasClientDeployment(vehicle)) return `Deployed to ${safeValue(vehicle.client, 'client')}`;
-  if (vehicle.status === 'Offline') return 'Offline';
-  return `${safeValue(vehicle.status, 'Unknown status')} - not eligible`;
+  if (vehicle.status === 'Offline') return 'Not in use';
+  return `${safeValue(vehicle.status, 'Unknown status')} - not deployed`;
 }
 
 function normalizeClientName(value) {

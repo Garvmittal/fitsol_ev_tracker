@@ -511,7 +511,7 @@ app.post('/api/deployments/end', requirePermission('deployments'), async (reques
     const reason = String(request.body?.reason || '').trim();
     const effectiveAt = String(request.body?.effectiveAt || '').trim();
     const parking = String(request.body?.parking || '').trim();
-    const driverChoice = String(request.body?.driverChoice || '').trim(); // optional, stored in reason for now
+    const replacementVehicle = String(request.body?.replacementVehicle || '').trim().toUpperCase();
 
     if (!vehicle || !effectiveAt || !parking) {
       return response.status(400).json({ error: 'Vehicle, effective time, and parking are required.' });
@@ -528,6 +528,15 @@ app.post('/api/deployments/end', requirePermission('deployments'), async (reques
 
     if (!activeDeployment?.deployment_id) return response.status(404).json({ error: 'No active client deployment found for this vehicle' });
     if (!canAccessClient(request.user, activeDeployment.client)) return response.status(403).json({ error: 'You cannot update deployments for this client' });
+    if (replacementVehicle) {
+      if (replacementVehicle === vehicle) return response.status(400).json({ error: 'Replacement vehicle must be different from the current vehicle' });
+      const replacementActive = latestByKey(
+        rows.filter((row) => String(row.vehicle || '').trim().toUpperCase() === replacementVehicle && normalizeBoolean(row.status || 'Active')),
+        'vehicle',
+        'created_at',
+      ).get(replacementVehicle);
+      if (replacementActive?.deployment_id) return response.status(400).json({ error: 'Replacement vehicle is already deployed' });
+    }
 
     const updated = await updateSheetRowById(
       sheets,
@@ -543,21 +552,54 @@ app.post('/api/deployments/end', requirePermission('deployments'), async (reques
       (row) => canAccessClient(request.user, row.client),
     );
 
-    const taskReason = [reason, driverChoice ? `Driver: ${driverChoice}` : ''].filter(Boolean).join('; ');
+    let replacementDeployment = null;
+    if (replacementVehicle) {
+      replacementDeployment = {
+        deployment_id: crypto.randomUUID(),
+        vehicle: replacementVehicle,
+        client: activeDeployment.client || '',
+        hub: activeDeployment.hub || '',
+        hub_gmp_link: activeDeployment.hub_gmp_link || '',
+        hub_lat: activeDeployment.hub_lat || '',
+        hub_lng: activeDeployment.hub_lng || '',
+        parking: activeDeployment.parking || '',
+        parking_gmp_link: activeDeployment.parking_gmp_link || '',
+        parking_lat: activeDeployment.parking_lat || '',
+        parking_lng: activeDeployment.parking_lng || '',
+        previous_undeploy_at: '',
+        deploy_at: effectiveAt,
+        layover_parking: '',
+        layover_parking_gmp_link: '',
+        layover_parking_lat: '',
+        layover_parking_lng: '',
+        usage: `Replacement for ${vehicle}`,
+        poc: activeDeployment.poc || '',
+        status: new Date(effectiveAt).getTime() > Date.now() ? 'Scheduled' : 'Active',
+        created_by: request.user.email || request.user.name,
+        created_at: new Date().toISOString(),
+      };
+      await appendRecord(sheets, deploymentsSheetName, deploymentHeaders(), replacementDeployment);
+    }
+
     const task = await createOpsTask(sheets, {
-      title: `Undeploy vehicle and park at ${parking}`,
+      title: replacementVehicle ? `Replace ${vehicle} with ${replacementVehicle}` : `Undeploy vehicle and park at ${parking}`,
       vehicle,
       client: activeDeployment.client,
       hub: activeDeployment.hub,
       parking,
       poc: activeDeployment.poc || '',
       due: effectiveAt,
-      reason: taskReason || 'Undeploy scheduled',
+      reason: reason || 'Undeploy scheduled',
       status: 'Pending',
       created_by: request.user.email || request.user.name,
     });
 
-    response.json({ ok: true, deployment: normalizeDeploymentRow(updated), task });
+    response.json({
+      ok: true,
+      deployment: normalizeDeploymentRow(updated),
+      replacementDeployment: replacementDeployment ? normalizeDeploymentRow(replacementDeployment) : null,
+      task,
+    });
   } catch (error) {
     response.status(500).json({ error: 'Unable to schedule undeploy', message: error.message });
   }
@@ -1466,7 +1508,6 @@ async function createDeploymentTasks(sheets, deployment) {
   const titles = [
     'Confirm deployment details with client POC',
     'Park vehicle at assigned parking',
-    'Assign driver and confirm shift start',
     deployment.layoverParking && deployment.layoverParking !== deployment.parking ? `Confirm layover parking readiness (${deployment.layoverParking})` : '',
     deployment.previousUndeployAt ? 'End previous deployment and log undeploy time' : '',
   ].filter(Boolean);
