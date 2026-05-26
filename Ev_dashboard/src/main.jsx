@@ -221,6 +221,8 @@ const tabPermissions = {
 };
 
 const primaryTabs = ['Overview', 'EV Fleet', 'Clients', 'Drivers', 'Parking', 'Operations', 'Admin'];
+const fleetGroupOptions = ['Deployed', 'Not deployed', 'Not in use'];
+const endDeploymentReasons = ['Completed', 'Returned', 'Replacement', 'Maintenance', 'Damaged', 'Reassigned', 'Other'];
 
 function App() {
   const [activeTab, setActiveTab] = useState('EV Fleet');
@@ -246,7 +248,7 @@ function App() {
     cngConsumption: 0.18,
     evEnergy: 0.22,
   });
-  const [statusFilter, setStatusFilter] = useState('Active');
+  const [statusFilter, setStatusFilter] = useState('Deployed');
   const [fleetFilters, setFleetFilters] = useState({ clients: [], models: [], statuses: [] });
   const [query, setQuery] = useState('');
   const [range, setRange] = useState({ from: '2026-04-29', to: '2026-05-06' });
@@ -342,8 +344,10 @@ function App() {
   const modelOptions = useMemo(() => uniqueOptions(vehicles.map(modelLabelFor)), [vehicles]);
   const vehicleStatusOptions = useMemo(() => uniqueOptions(vehicles.map((vehicle) => vehicle.status)), [vehicles]);
   const clientOptions = useMemo(() => uniqueOptions(vehicles.map((vehicle) => normalizeClientName(vehicle.client)).filter(Boolean)), [vehicles]);
-  const activeVehicleCount = vehicles.filter((vehicle) => vehicle.status !== 'Offline').length;
-  const offlineVehicleCount = vehicles.filter((vehicle) => vehicle.status === 'Offline').length;
+  const fleetGroupCounts = useMemo(() => vehicles.reduce((counts, vehicle) => {
+    const group = vehicleFleetGroup(vehicle);
+    return { ...counts, [group]: (counts[group] || 0) + 1 };
+  }, Object.fromEntries(fleetGroupOptions.map((group) => [group, 0]))), [vehicles]);
   const driverContactByVehicle = useMemo(() => {
     const map = new Map();
     (driverAssignments || []).forEach((assignment) => {
@@ -387,7 +391,7 @@ function App() {
         .join(' ')
         .toLowerCase()
         .includes(query.toLowerCase());
-      const matchesStatusGroup = statusFilter === 'Offline' ? vehicle.status === 'Offline' : vehicle.status !== 'Offline';
+      const matchesStatusGroup = vehicleFleetGroup(vehicle) === statusFilter;
       const matchesVehicleStatus = !fleetFilters.statuses.length || fleetFilters.statuses.includes(vehicle.status);
       const matchesModel = !fleetFilters.models.length || fleetFilters.models.includes(modelLabelFor(vehicle));
       const matchesClient = !fleetFilters.clients.length || fleetFilters.clients.includes(normalizeClientName(vehicle.client));
@@ -397,7 +401,7 @@ function App() {
 
   const mapFiltersActive = Boolean(
     query.trim()
-    || statusFilter === 'Offline'
+    || statusFilter
     || fleetFilters.clients.length
     || fleetFilters.models.length
     || fleetFilters.statuses.length
@@ -837,17 +841,17 @@ function App() {
     return true;
   }
 
-  async function scheduleDeploymentEnd({ vehicle, reason, effectiveAt, parking, driverChoice }) {
+  async function scheduleDeploymentEnd({ vehicle, reason, effectiveAt, parking, replacementVehicle }) {
     if (!vehicle || !effectiveAt || !parking) return null;
     try {
       const payload = await apiJson('/api/deployments/end', {
         method: 'POST',
-        body: JSON.stringify({ vehicle, reason, effectiveAt, parking, driverChoice }),
+        body: JSON.stringify({ vehicle, reason, effectiveAt, parking, replacementVehicle }),
       });
       if (payload.task) setTasks((current) => [payload.task, ...current]);
-      setToast('Undeploy scheduled and task created.');
+      setToast(replacementVehicle ? 'Replacement scheduled with undeploy task.' : 'Undeploy scheduled and task created.');
       window.setTimeout(() => setToast(''), 2400);
-      return { vehicle, reason, effectiveAt, parking, driverChoice };
+      return { vehicle, reason, effectiveAt, parking, replacementVehicle };
     } catch (error) {
       setToast(error.message || 'Unable to schedule undeploy.');
       window.setTimeout(() => setToast(''), 2600);
@@ -1044,8 +1048,7 @@ function App() {
 	            vehicleStatusOptions={vehicleStatusOptions}
 	            modelOptions={modelOptions}
 	            clientOptions={clientOptions}
-	            activeVehicleCount={activeVehicleCount}
-	            offlineVehicleCount={offlineVehicleCount}
+	            fleetGroupCounts={fleetGroupCounts}
 	            query={query}
 	            setQuery={setQuery}
 	            mapConfig={mapConfig}
@@ -1174,10 +1177,8 @@ function OperationsHub({
   addDriver,
   parkings,
   addParkingSite,
-  markTaskDone,
   openFleet,
   selectVehicle,
-  tasks,
   vehicles,
   scheduleDeploymentEnd,
   updateDeployment,
@@ -1227,7 +1228,12 @@ function OperationsHub({
     if (result?.vehicle && result?.effectiveAt) {
       setScheduledEnds((current) => {
         const next = new Map(current);
-        next.set(result.vehicle, { effectiveAt: result.effectiveAt, parking: result.parking, reason: result.reason, driverChoice: result.driverChoice });
+        next.set(result.vehicle, {
+          effectiveAt: result.effectiveAt,
+          parking: result.parking,
+          reason: result.reason,
+          replacementVehicle: result.replacementVehicle,
+        });
         return next;
       });
       return true;
@@ -1307,8 +1313,6 @@ function OperationsHub({
         </div>
       </div>
 
-      <OpsActionCenter tasks={tasks} markTaskDone={markTaskDone} selectVehicle={selectVehicle} openFleet={openFleet} />
-
       {deployOpen && (
         <DeployVehicleModal
           vehicles={vehicles}
@@ -1342,11 +1346,10 @@ function OperationsHub({
       {endTarget && (
         <EndDeploymentModal
           vehicle={endTarget}
+          vehicles={vehicles}
           parkings={parkings}
-          drivers={drivers}
           closeModal={() => setEndTarget(null)}
           onOpenAddParking={() => setParkingModalOpen(true)}
-          onOpenAddDriver={() => setDriverModalOpen(true)}
           scheduleEnd={async (payload) => {
             const ok = await handleScheduleEnd(payload);
             if (ok) setEndTarget(null);
@@ -1636,12 +1639,12 @@ function DeployVehicleModal({ vehicles, clientHubs, parkings, drivers, addDeploy
   );
 }
 
-function EndDeploymentModal({ vehicle, parkings, drivers, closeModal, onOpenAddParking, onOpenAddDriver, scheduleEnd }) {
-  const [reason, setReason] = useState('');
+function EndDeploymentModal({ vehicle, vehicles, parkings, drivers = [], closeModal, onOpenAddParking, scheduleEnd }) {
+  const [reason, setReason] = useState(endDeploymentReasons[0]);
+  const [customReason, setCustomReason] = useState('');
   const [effectiveAt, setEffectiveAt] = useState(new Date(Date.now() + 15 * 60 * 1000).toISOString().slice(0, 16));
   const [parking, setParking] = useState(parkings?.[0]?.name || '');
-  const [useDefaultDriver, setUseDefaultDriver] = useState(true);
-  const [driverEmail, setDriverEmail] = useState('');
+  const [replacementVehicle, setReplacementVehicle] = useState('');
 
   const driverOptions = useMemo(() => (drivers || []).map((d) => ({ id: d.driverId || d.id, label: `${d.name}${d.phone ? ` • ${d.phone}` : ''}`, email: d.email })), [drivers]);
 
@@ -1922,7 +1925,7 @@ function CarbonTrendChart({ points }) {
   );
 }
 
-function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, activeVehicleCount, offlineVehicleCount, query, setQuery, mapConfig, parkings, clientHubs, driverContactByVehicle }) {
+function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, fleetGroupCounts, query, setQuery, mapConfig, parkings, clientHubs, driverContactByVehicle }) {
   return (
     <>
       <Toolbar
@@ -1933,8 +1936,7 @@ function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, stat
         vehicleStatusOptions={vehicleStatusOptions}
         modelOptions={modelOptions}
         clientOptions={clientOptions}
-        activeVehicleCount={activeVehicleCount}
-        offlineVehicleCount={offlineVehicleCount}
+        fleetGroupCounts={fleetGroupCounts}
         query={query}
         setQuery={setQuery}
       />
@@ -1957,19 +1959,18 @@ function FleetView({ filteredVehicles, selected, selectedId, setSelectedId, stat
   );
 }
 
-function Toolbar({ statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, activeVehicleCount, offlineVehicleCount, query, setQuery }) {
+function Toolbar({ statusFilter, setStatusFilter, fleetFilters, setFleetFilters, vehicleStatusOptions, modelOptions, clientOptions, fleetGroupCounts, query, setQuery }) {
   const scopedStatusOptions = useMemo(() => vehicleStatusOptions.filter((status) => (
-    statusFilter === 'Offline' ? status === 'Offline' : status !== 'Offline'
+    statusFilter === 'Not in use' ? status === 'Offline' : status !== 'Offline'
   )), [vehicleStatusOptions, statusFilter]);
   return (
     <section className="toolbar">
       <div className="status-toggle">
-        <button className={statusFilter === 'Active' ? 'pill active' : 'pill'} onClick={() => setStatusFilter('Active')} type="button">
-          Active <span>{activeVehicleCount}</span>
-        </button>
-        <button className={statusFilter === 'Offline' ? 'pill active' : 'pill'} onClick={() => setStatusFilter('Offline')} type="button">
-          Offline <span>{offlineVehicleCount}</span>
-        </button>
+        {fleetGroupOptions.map((group) => (
+          <button className={statusFilter === group ? 'pill active' : 'pill'} key={group} onClick={() => setStatusFilter(group)} type="button">
+            {group} <span>{fleetGroupCounts?.[group] || 0}</span>
+          </button>
+        ))}
       </div>
       <label className="search-box">
         <Search size={20} />
@@ -3983,6 +3984,12 @@ function hasClientDeployment(vehicle) {
     || vehicle?.parkingGmpLink
     || (safeValue(vehicle?.hub, '') && safeValue(vehicle?.hub, '') !== 'Unassigned hub' && safeValue(vehicle?.parking, '') !== 'Parking unavailable')
   );
+}
+
+function vehicleFleetGroup(vehicle) {
+  if (vehicle?.status === 'Offline') return 'Not in use';
+  if (hasClientDeployment(vehicle)) return 'Deployed';
+  return 'Not deployed';
 }
 
 function isCurrentDriverAssignment(assignment) {
