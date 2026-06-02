@@ -156,16 +156,93 @@ app.post('/api/auth/logout', (_request, response) => {
   response.json({ ok: true });
 });
 
+app.get('/api/client-portals/access', async (request, response) => {
+  try {
+    const portal = await resolveClientPortalAccess(request.query.token);
+    response.json({ portal: clientPortalSummary(portal) });
+  } catch (error) {
+    response.status(404).json({ error: error.message || 'This client link is invalid or no longer active' });
+  }
+});
+
+app.get('/api/client-portals/me', async (request, response) => {
+  try {
+    const session = getSession(request);
+    if (!session?.user?.email) return response.status(401).json({ error: 'Not signed in' });
+    const portal = await resolveClientPortalAccess(request.query.token, session.user.email);
+    if (!portal.allowed) return response.status(403).json({ error: 'This email is not allowed to open this client link' });
+    response.json({ user: clientPortalUser(session.user.email, portal), portal: clientPortalSummary(portal) });
+  } catch (error) {
+    response.status(403).json({ error: error.message || 'Unable to open this client link' });
+  }
+});
+
+app.post('/api/client-portals/request-otp', async (request, response) => {
+  try {
+    const email = normalizeEmail(request.body?.email);
+    const token = String(request.body?.token || '').trim();
+    if (!email) return response.status(400).json({ error: 'Email is required' });
+    const portal = await resolveClientPortalAccess(token, email);
+    if (!portal.allowed) return response.status(403).json({ error: 'This email is not allowed to open this client link' });
+    const otp = String(crypto.randomInt(100000, 999999));
+    otpStore.set(clientPortalOtpKey(token, email), {
+      otpHash: hashOtp(otp),
+      expiresAt: Date.now() + otpExpiryMinutes * 60 * 1000,
+      user: clientPortalUser(email, portal),
+    });
+    const mail = await sendMail({
+      to: email,
+      subject: `Your ${portal.client} live fleet sign-in OTP`,
+      text: `Your live fleet OTP is ${otp}. It expires in ${otpExpiryMinutes} minutes.\n\nIf you did not request this, ignore this email.`,
+    });
+    response.json({ ok: true, delivery: mail.mode, devOtp: otpDevMode && mail.mode === 'dev' ? otp : undefined });
+  } catch (error) {
+    response.status(500).json({ error: error.message || 'Unable to send OTP' });
+  }
+});
+
+app.post('/api/client-portals/verify-otp', async (request, response) => {
+  const email = normalizeEmail(request.body?.email);
+  const token = String(request.body?.token || '').trim();
+  const otp = String(request.body?.otp || '').trim();
+  const key = clientPortalOtpKey(token, email);
+  const pending = otpStore.get(key);
+  if (!pending || pending.expiresAt < Date.now() || pending.otpHash !== hashOtp(otp)) {
+    return response.status(401).json({ error: 'Invalid or expired OTP' });
+  }
+  try {
+    const portal = await resolveClientPortalAccess(token, email);
+    if (!portal.allowed) return response.status(403).json({ error: 'This email is not allowed to open this client link' });
+    otpStore.delete(key);
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    const user = clientPortalUser(email, portal);
+    sessions.set(sessionToken, {
+      user,
+      expiresAt: Date.now() + sessionExpiryHours * 60 * 60 * 1000,
+    });
+    response.setHeader('Set-Cookie', sessionCookie(sessionToken, sessionExpiryHours * 60 * 60));
+    response.json({ user, portal: clientPortalSummary(portal) });
+  } catch (error) {
+    response.status(403).json({ error: error.message || 'Unable to open this client link' });
+  }
+});
+
+app.get('/api/client-portals/fleet', async (request, response) => {
+  try {
+    const session = getSession(request);
+    if (!session?.user?.email) return response.status(401).json({ error: 'Authentication required' });
+    const portal = await resolveClientPortalAccess(request.query.token, session.user.email);
+    if (!portal.allowed) return response.status(403).json({ error: 'This email is not allowed to open this client link' });
+    const payload = await fleetPayloadForUser(clientPortalUser(session.user.email, portal));
+    response.json({ ...payload, portal: clientPortalSummary(portal) });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to load client fleet', message: error.message });
+  }
+});
+
 app.get('/api/fleet', requirePermission('fleet'), async (request, response) => {
   try {
-    const sheets = await getSheetsClient();
-    const { sheetTitle, records: rawRecords } = await getFleetData(sheets);
-    const assignments = await getLatestAssignmentsByVehicle(sheets);
-    const deployments = await getLatestDeploymentsByVehicle(sheets);
-    const settings = await getDashboardSettings(sheets);
-    const vehicles = normalizeFleetRecords(scopeRows(rawRecords, request.user), settings)
-      .map((vehicle, index) => mergeVehicleOpsData(vehicle, deployments.get(vehicle.id), assignments.get(vehicle.id), index));
-    response.json({ sheetTitle, vehicles, updatedAt: new Date().toISOString() });
+    response.json(await fleetPayloadForUser(request.user));
   } catch (error) {
     response.status(500).json({
       error: 'Unable to load fleet sheet',
@@ -174,6 +251,24 @@ app.get('/api/fleet', requirePermission('fleet'), async (request, response) => {
     });
   }
 });
+
+async function fleetPayloadForUser(user) {
+  const sheets = await getSheetsClient();
+  const { sheetTitle, records: rawRecords } = await getFleetData(sheets);
+  const assignments = await getLatestAssignmentsByVehicle(sheets);
+  const deployments = await getLatestDeploymentsByVehicle(sheets);
+  const settings = await getDashboardSettings(sheets);
+  const vehicles = normalizeFleetRecords(rawRecords, settings)
+    .map((vehicle, index) => mergeVehicleOpsData(vehicle, deployments.get(vehicle.id), assignments.get(vehicle.id), index));
+  const portalVehicleIds = user?.portalId
+    ? new Set([...deployments.entries()]
+        .filter(([, deployment]) => canAccessClient(user, deployment.client))
+        .map(([vehicle]) => vehicle))
+    : null;
+  const scopedVehicles = scopeRows(vehicles, user)
+    .filter((vehicle) => !portalVehicleIds || portalVehicleIds.has(vehicle.id));
+  return { sheetTitle, vehicles: scopedVehicles, updatedAt: new Date().toISOString() };
+}
 
 app.get('/api/client-hubs', requirePermission('fleet'), async (request, response) => {
   try {
@@ -815,6 +910,61 @@ app.post('/api/parking-sites', requirePermission('deployments'), async (request,
   }
 });
 
+app.get('/api/client-portals', requirePermission('deployments'), async (_request, response) => {
+  try {
+    requireClientPortalStorage();
+    const portals = await supabaseModule.listClientPortals();
+    response.json({ portals: portals.map(normalizeClientPortalRecord) });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to load client links', message: error.message });
+  }
+});
+
+app.post('/api/client-portals', requirePermission('deployments'), async (request, response) => {
+  try {
+    requireClientPortalStorage();
+    const client = String(request.body?.client || '').trim();
+    const allowedEmails = parseEmailList(request.body?.allowedEmails);
+    if (!client) return response.status(400).json({ error: 'Client is required' });
+    if (!allowedEmails.length) return response.status(400).json({ error: 'Add at least one allowed email' });
+    await supabaseModule.createClientPortal({
+      portal_id: crypto.randomUUID(),
+      share_token: crypto.randomBytes(32).toString('hex'),
+      label: String(request.body?.label || `${client} live fleet`).trim(),
+      client,
+      allowed_emails: allowedEmails,
+      active: request.body?.active !== false,
+      created_by: request.user.email || request.user.name,
+      created_at: new Date().toISOString(),
+    });
+    const portals = await supabaseModule.listClientPortals();
+    response.json({ ok: true, portals: portals.map(normalizeClientPortalRecord) });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to save client link', message: error.message });
+  }
+});
+
+app.patch('/api/client-portals/:portalId', requirePermission('deployments'), async (request, response) => {
+  try {
+    requireClientPortalStorage();
+    const portalId = String(request.params.portalId || '').trim();
+    const allowedEmails = parseEmailList(request.body?.allowedEmails);
+    if (!allowedEmails.length) return response.status(400).json({ error: 'Add at least one allowed email' });
+    const updated = await supabaseModule.updateClientPortal(portalId, {
+      label: String(request.body?.label || '').trim(),
+      allowed_emails: allowedEmails,
+      active: request.body?.active !== false,
+      updated_by: request.user.email || request.user.name,
+      updated_at: new Date().toISOString(),
+    });
+    if (!updated) return response.status(404).json({ error: 'Client link not found' });
+    const portals = await supabaseModule.listClientPortals();
+    response.json({ ok: true, portals: portals.map(normalizeClientPortalRecord) });
+  } catch (error) {
+    response.status(500).json({ error: 'Unable to update client link', message: error.message });
+  }
+});
+
 app.post('/api/driver-session', requirePermission('driver'), async (request, response) => {
   try {
     const assignmentId = String(request.body?.assignmentId || '').trim();
@@ -1322,6 +1472,50 @@ async function getAlertRecipients(sheets) {
     .filter((row) => row.email && row.active);
 }
 
+function requireClientPortalStorage() {
+  if (!supabaseModule?.isConfigured) {
+    throw new Error('Client links require SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY');
+  }
+}
+
+async function resolveClientPortalAccess(token, email = '') {
+  requireClientPortalStorage();
+  const shareToken = String(token || '').trim();
+  if (!shareToken) throw new Error('Client link token is required');
+  const row = await supabaseModule.findClientPortalByToken(shareToken);
+  const portal = normalizeClientPortalRecord(row);
+  if (!portal || !portal.active) throw new Error('This client link is invalid or no longer active');
+  return {
+    ...portal,
+    allowed: Boolean(email) && portal.allowedEmails.includes(normalizeEmail(email)),
+  };
+}
+
+function clientPortalUser(email, portal) {
+  return {
+    name: email,
+    email,
+    role: 'client',
+    client: portal.client,
+    permissions: ['fleet', 'reports'],
+    portalId: portal.portalId,
+  };
+}
+
+function clientPortalSummary(portal) {
+  return {
+    portalId: portal.portalId,
+    label: portal.label,
+    client: portal.client,
+    active: portal.active,
+    allowed: portal.allowed === true,
+  };
+}
+
+function clientPortalOtpKey(token, email) {
+  return `client-portal:${String(token || '').trim()}:${normalizeEmail(email)}`;
+}
+
 function requirePermission(permission) {
   return (request, response, next) => {
     const session = getSession(request);
@@ -1483,6 +1677,20 @@ function normalizeParkingSiteSupabaseRow(row) {
     lng: toNumber(row.lng),
     createdAt: row.created_at || '',
     updatedAt: row.updated_at || '',
+  };
+}
+
+function normalizeClientPortalRecord(row) {
+  if (!row) return null;
+  return {
+    portalId: row.portal_id || row.portalId || '',
+    shareToken: row.share_token || row.shareToken || '',
+    label: row.label || '',
+    client: row.client || '',
+    allowedEmails: parseEmailList(row.allowed_emails || row.allowedEmails),
+    active: row.active !== false,
+    createdAt: row.created_at || row.createdAt || '',
+    updatedAt: row.updated_at || row.updatedAt || '',
   };
 }
 
@@ -2471,6 +2679,11 @@ function hashOtp(otp) {
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function parseEmailList(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(/[\s,;]+/);
+  return [...new Set(items.map(normalizeEmail).filter((email) => email && email.includes('@')))];
 }
 
 function simplifyPlaceLabel(address) {

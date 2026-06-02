@@ -67,6 +67,7 @@ async function mockUiApis(page, initialClients = [], options = {}) {
   let assignments = [];
   let tasks = [];
   const fleet = options.fleet || fleetPayload;
+  let portals = options.portals || [];
   let parkings = options.parkings || [
     { parkingId: 'uat-parking-1', name: 'Gate A Parking', location: 'UAT', gmpLink: 'https://www.google.com/maps/@28.6139,77.2090,18z', lat: 28.6139, lng: 77.209 },
   ];
@@ -109,6 +110,34 @@ async function mockUiApis(page, initialClients = [], options = {}) {
       return;
     }
     await route.fulfill({ json: { clients } });
+  });
+  await page.route('**/api/client-portals', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = JSON.parse(route.request().postData() || '{}');
+      portals = [{
+        portalId: `uat-portal-${portals.length + 1}`,
+        shareToken: `uat-token-${portals.length + 1}`,
+        label: body.label,
+        client: body.client,
+        allowedEmails: String(body.allowedEmails || '').split(/[\s,;]+/).filter(Boolean),
+        active: true,
+      }, ...portals];
+      await route.fulfill({ json: { ok: true, portals } });
+      return;
+    }
+    await route.fulfill({ json: { portals } });
+  });
+  await page.route('**/api/client-portals/*', async (route) => {
+    if (route.request().method() !== 'PATCH') return route.fallback();
+    const body = JSON.parse(route.request().postData() || '{}');
+    const portalId = route.request().url().split('/').pop();
+    portals = portals.map((portal) => (portal.portalId === portalId ? {
+      ...portal,
+      label: body.label,
+      allowedEmails: String(body.allowedEmails || '').split(/[\s,;]+/).filter(Boolean),
+      active: body.active !== false,
+    } : portal));
+    await route.fulfill({ json: { ok: true, portals } });
   });
   await page.route('**/api/deployments', async (route) => {
     if (route.request().method() === 'POST') {
@@ -258,6 +287,21 @@ test.describe('UAT gate: real backend readiness', () => {
 });
 
 test.describe('UAT gate: operations flow permutations', () => {
+  test('creates a client live link and updates its allowed emails', async ({ page }) => {
+    await mockUiApis(page, mappedClients, { portals: [] });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Operations' }).click();
+    await page.getByRole('button', { name: 'Create client link' }).click();
+    await page.getByLabel('Link name').fill('Acme dispatch live');
+    await page.getByLabel('Allowed email IDs').fill('dispatch@acme.example');
+    await page.getByRole('button', { name: 'Create link' }).click();
+    await expect(page.getByText('Acme dispatch live')).toBeVisible();
+    await page.getByRole('button', { name: 'Edit' }).click();
+    await page.getByLabel('Allowed email IDs').fill('dispatch@acme.example\nmanager@acme.example');
+    await page.getByRole('button', { name: 'Save access' }).click();
+    await expect(page.getByRole('region', { name: 'Client live links table' }).getByRole('cell', { name: '2', exact: true })).toBeVisible();
+  });
+
   test('deploy modal offers Add client fallback when no clients exist', async ({ page }) => {
     await mockUiApis(page, []);
     await page.goto('/');
@@ -359,6 +403,26 @@ test.describe('UAT gate: operations flow permutations', () => {
 
     await expect(page.getByText('Alert thresholds and carbon factors saved.')).toBeVisible();
     await expect(page.getByText('Vehicles above 82% charge and below 2.5 km movement are eligible for unused-vehicle alerts.')).toBeVisible();
+  });
+});
+
+test.describe('UAT gate: client live links', () => {
+  test('shared client page renders only the vehicles returned for that portal', async ({ page }) => {
+    const portal = { portalId: 'uat-portal-1', label: 'Acme dispatch live', client: 'Acme Logistics', active: true, allowed: true };
+    await page.route('**/api/client-portals/access?**', async (route) => {
+      await route.fulfill({ json: { portal } });
+    });
+    await page.route('**/api/client-portals/me?**', async (route) => {
+      await route.fulfill({ json: { portal, user: { name: 'dispatch@acme.example', email: 'dispatch@acme.example', role: 'client', client: 'Acme Logistics', permissions: ['fleet', 'reports'], portalId: portal.portalId } } });
+    });
+    await page.route('**/api/client-portals/fleet?**', async (route) => {
+      await route.fulfill({ json: { portal, vehicles: [{ ...fleetPayload.vehicles[0], client: 'Acme Logistics', hub: 'Delhi Hub', parking: 'Gate A Parking' }], updatedAt: new Date().toISOString() } });
+    });
+    await page.goto('/?portal=uat-token-1');
+    await expect(page.getByRole('heading', { name: 'Acme dispatch live' })).toBeVisible();
+    await expect(page.getByText('HR55AY2609')).toBeVisible();
+    await expect(page.getByText('DL51EV1938')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Operations' })).toHaveCount(0);
   });
 });
 

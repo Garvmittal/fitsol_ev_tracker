@@ -7,6 +7,7 @@ import {
   Car,
   Check,
   CircleAlert,
+  Copy,
   Download,
   ExternalLink,
   Filter,
@@ -15,6 +16,7 @@ import {
   IdCard,
   LogIn,
   LogOut,
+  Link2,
   Mail,
   MapPin,
   Navigation,
@@ -233,6 +235,7 @@ function App() {
   const [driverAssignments, setDriverAssignments] = useState(driverSeed);
   const [clientHubs, setClientHubs] = useState(clientHubSeed);
   const [drivers, setDrivers] = useState([]);
+  const [clientPortals, setClientPortals] = useState([]);
   const initialParkingSeed = (() => {
     const names = Array.from(new Set(vehiclesSeed.map((v) => v.parking).filter(Boolean)));
     return names.map((name, idx) => ({ id: `P${idx + 1}`, name, location: '', gmpLink: '', lat: undefined, lng: undefined }));
@@ -297,6 +300,26 @@ function App() {
   // Compatibility: keep the legacy Operations helpers that expect `addParking`.
   function addParking({ name, gmpLink }) {
     addParkingSite({ name, location: '', gmpLink });
+  }
+
+  async function saveClientPortal(portal) {
+    try {
+      const payload = await apiJson(
+        portal.portalId ? `/api/client-portals/${encodeURIComponent(portal.portalId)}` : '/api/client-portals',
+        {
+          method: portal.portalId ? 'PATCH' : 'POST',
+          body: JSON.stringify(portal),
+        },
+      );
+      setClientPortals(payload.portals || []);
+      setToast(portal.portalId ? 'Client link updated.' : 'Client link created.');
+      window.setTimeout(() => setToast(''), 2400);
+      return true;
+    } catch (error) {
+      setToast(error.message || 'Unable to save client link.');
+      window.setTimeout(() => setToast(''), 2600);
+      return false;
+    }
   }
 
   useEffect(() => {
@@ -379,6 +402,7 @@ function App() {
 	    }
 	    if (canAccess(auth.user, 'deployments')) {
 	      apiJson('/api/parking-sites').then((payload) => payload.parkings && setParkings(payload.parkings)).catch(() => {});
+	      apiJson('/api/client-portals').then((payload) => payload.portals && setClientPortals(payload.portals)).catch(() => {});
 	    }
 	    if (canAccess(auth.user, 'reports')) {
 	      apiJson('/api/settings').then((payload) => payload.settings && setSettingsState(payload.settings)).catch(() => {});
@@ -1105,6 +1129,7 @@ function App() {
             addClient={addClient}
             assignments={driverAssignments}
             clientHubs={clientHubs}
+            clientPortals={clientPortals}
             drivers={drivers}
             addDriver={addDriver}
             addDeployment={addDeployment}
@@ -1114,6 +1139,7 @@ function App() {
             parkings={parkings}
             addParkingSite={addParkingSite}
             scheduleDeploymentEnd={scheduleDeploymentEnd}
+            saveClientPortal={saveClientPortal}
             updateDeployment={updateDeployment}
           />
         )}
@@ -1189,11 +1215,206 @@ function LoginScreen({ email, setEmail, otp, setOtp, otpSent, requestOtp, verify
   );
 }
 
+function ClientPortalApp({ token }) {
+  const [portal, setPortal] = useState(null);
+  const [user, setUser] = useState(null);
+  const [vehicles, setVehicles] = useState([]);
+  const [updatedAt, setUpdatedAt] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [fleetLoading, setFleetLoading] = useState(false);
+  const [email, setEmail] = useState('');
+  const [otp, setOtp] = useState('');
+  const [otpSent, setOtpSent] = useState(false);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    apiJson(`/api/client-portals/access?token=${encodeURIComponent(token)}`)
+      .then((payload) => {
+        if (!cancelled) setPortal(payload.portal);
+        return apiJson(`/api/client-portals/me?token=${encodeURIComponent(token)}`);
+      })
+      .then((payload) => {
+        if (!cancelled) setUser(payload.user);
+      })
+      .catch((error) => {
+        if (!cancelled && !portal && !/not signed in/i.test(error.message || '')) setMessage(error.message || 'Unable to open this client link.');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [token]);
+
+  async function reloadFleet() {
+    setFleetLoading(true);
+    try {
+      const payload = await apiJson(`/api/client-portals/fleet?token=${encodeURIComponent(token)}`);
+      setVehicles(payload.vehicles || []);
+      setUpdatedAt(payload.updatedAt || new Date().toISOString());
+      if (payload.portal) setPortal(payload.portal);
+    } catch (error) {
+      setMessage(error.message || 'Unable to refresh live vehicles.');
+    } finally {
+      setFleetLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!user) return undefined;
+    reloadFleet();
+    const interval = window.setInterval(reloadFleet, 60000);
+    return () => window.clearInterval(interval);
+  }, [user?.email, token]);
+
+  async function requestOtp(event) {
+    event.preventDefault();
+    setMessage('Sending OTP...');
+    try {
+      const payload = await apiJson('/api/client-portals/request-otp', {
+        method: 'POST',
+        body: JSON.stringify({ token, email }),
+      });
+      if (payload.devOtp) setOtp(payload.devOtp);
+      setOtpSent(true);
+      setMessage(payload.devOtp ? `OTP sent. Development OTP: ${payload.devOtp}` : 'OTP sent. Check your email.');
+    } catch (error) {
+      setMessage(error.message || 'Unable to send OTP.');
+    }
+  }
+
+  async function verifyOtp(event) {
+    event.preventDefault();
+    setMessage('Verifying OTP...');
+    try {
+      const payload = await apiJson('/api/client-portals/verify-otp', {
+        method: 'POST',
+        body: JSON.stringify({ token, email, otp }),
+      });
+      setPortal(payload.portal || portal);
+      setUser(payload.user);
+      setMessage('');
+    } catch (error) {
+      setMessage(error.message || 'Invalid or expired OTP.');
+    }
+  }
+
+  async function logout() {
+    await apiJson('/api/auth/logout', { method: 'POST' });
+    setUser(null);
+    setVehicles([]);
+    setOtp('');
+    setOtpSent(false);
+    setMessage('');
+  }
+
+  if (loading) return <AuthLoadingScreen />;
+  if (!portal) {
+    return <ClientPortalLogin portal={null} email={email} setEmail={setEmail} otp={otp} setOtp={setOtp} otpSent={otpSent} requestOtp={requestOtp} verifyOtp={verifyOtp} message={message || 'This client link is invalid or no longer active.'} />;
+  }
+  if (!user) {
+    return <ClientPortalLogin portal={portal} email={email} setEmail={setEmail} otp={otp} setOtp={setOtp} otpSent={otpSent} requestOtp={requestOtp} verifyOtp={verifyOtp} message={message} />;
+  }
+  return <ClientLivePortal portal={portal} vehicles={vehicles} updatedAt={updatedAt} fleetLoading={fleetLoading} reloadFleet={reloadFleet} logout={logout} user={user} />;
+}
+
+function ClientPortalLogin({ portal, email, setEmail, otp, setOtp, otpSent, requestOtp, verifyOtp, message }) {
+  const invalid = !portal;
+  return (
+    <main className="login-shell">
+      <form className="login-card" onSubmit={otpSent ? verifyOtp : requestOtp}>
+        <div className="brand-card">
+          <div className="brand-mark"><Navigation size={22} /></div>
+          <span>Fitsol</span>
+        </div>
+        <h1>{portal?.label || 'Client live fleet'}</h1>
+        <p>{invalid ? 'This shared link cannot be opened.' : `Sign in with an email approved by ${portal.client}.`}</p>
+        {!invalid && <label>Email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" required /></label>}
+        {!invalid && otpSent && <label>OTP<input value={otp} onChange={(event) => setOtp(event.target.value)} placeholder="6 digit code" inputMode="numeric" required /></label>}
+        {message && <mark>{message}</mark>}
+        {!invalid && <button className="primary-action" type="submit">{otpSent ? <LogIn size={18} /> : <Mail size={18} />}{otpSent ? 'Verify OTP' : 'Send OTP'}</button>}
+      </form>
+    </main>
+  );
+}
+
+function ClientLivePortal({ portal, vehicles, updatedAt, fleetLoading, reloadFleet, logout, user }) {
+  const [query, setQuery] = useState('');
+  const filteredVehicles = vehicles.filter((vehicle) => [vehicle.id, vehicle.hub, vehicle.parking, vehicle.status]
+    .join(' ')
+    .toLowerCase()
+    .includes(query.trim().toLowerCase()));
+  const running = vehicles.filter((vehicle) => vehicle.status === 'Running').length;
+  const offline = vehicles.filter((vehicle) => vehicle.status === 'Offline').length;
+
+  return (
+    <div className="app-shell client-live-shell">
+      <TopNav user={{ ...user, name: portal.client }} logout={logout} />
+      <main>
+        <div className="title-row client-live-title">
+          <div>
+            <span className="client-live-kicker">Client live view</span>
+            <h1>{portal.label}</h1>
+            <p>{portal.client} deployed vehicles only. Updated {formatRelativeTimestamp(updatedAt) || 'when telemetry loads'}.</p>
+          </div>
+          <button className="ghost-action" type="button" onClick={reloadFleet} disabled={fleetLoading}>
+            <RefreshCw size={18} /> {fleetLoading ? 'Refreshing...' : 'Refresh telemetry'}
+          </button>
+        </div>
+
+        <section className="metrics-grid client-live-metrics">
+          <MetricCard icon={Truck} label="Deployed vehicles" value={vehicles.length} />
+          <MetricCard icon={Route} label="Running now" value={running} />
+          <MetricCard icon={CircleAlert} label="Offline" value={offline} />
+        </section>
+
+        <section className="table-panel client-live-panel">
+          <div className="panel-title">
+            <div>
+              <h2>Live Vehicles</h2>
+              <p className="form-note">Location, charge, and telemetry freshness for vehicles deployed against your account.</p>
+            </div>
+            <label className="client-live-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search vehicle..." /></label>
+          </div>
+          <div className="client-live-grid">
+            {filteredVehicles.length ? filteredVehicles.map((vehicle) => (
+              <article className="client-live-card" key={vehicle.id}>
+                <div className="client-live-card-head">
+                  <div>
+                    <span>{modelLabelFor(vehicle)}</span>
+                    <h3>{vehicle.id}</h3>
+                  </div>
+                  <span className={`status-pill ${vehicle.status === 'Offline' ? 'warning' : 'success'}`}>{vehicle.status}</span>
+                </div>
+                <div className="client-live-card-grid">
+                  <span><strong>Battery</strong>{formatPercent(vehicle.battery)}</span>
+                  <span><strong>Distance today</strong>{formatNumber(vehicle.todayDistance)} km</span>
+                  <span><strong>Hub</strong>{safeValue(vehicle.hub, 'Unassigned')}</span>
+                  <span><strong>Parking</strong>{safeValue(vehicle.parking, 'Unavailable')}</span>
+                </div>
+                <div className="client-live-location">
+                  <MapPin size={17} />
+                  <span>{safeValue(vehicle.location, safeValue(vehicle.lastStop, 'Location unavailable'))}</span>
+                </div>
+                <div className="client-live-card-foot">
+                  <small>Updated {formatRelativeTimestamp(vehicle.lastUpdated) || 'unavailable'}</small>
+                  {vehicleMapLink(vehicle) && <a href={vehicleMapLink(vehicle)} target="_blank" rel="noreferrer"><ExternalLink size={15} /> Open map</a>}
+                </div>
+              </article>
+            )) : <div className="empty-state">No matching deployed vehicles are available for this client link.</div>}
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
+
 function OperationsHub({
   addClient,
   addDeployment,
   assignments,
   clientHubs,
+  clientPortals,
   drivers,
   addDriver,
   parkings,
@@ -1202,6 +1423,7 @@ function OperationsHub({
   selectVehicle,
   vehicles,
   scheduleDeploymentEnd,
+  saveClientPortal,
   updateDeployment,
 }) {
   const [deployOpen, setDeployOpen] = useState(false);
@@ -1210,6 +1432,7 @@ function OperationsHub({
   const [clientModalOpen, setClientModalOpen] = useState(false);
   const [parkingModalOpen, setParkingModalOpen] = useState(false);
   const [driverModalOpen, setDriverModalOpen] = useState(false);
+  const [portalModal, setPortalModal] = useState(null);
   const [scheduledEnds, setScheduledEnds] = useState(() => new Map());
 
   const latestAssignmentByVehicle = useMemo(() => {
@@ -1334,6 +1557,13 @@ function OperationsHub({
         </div>
       </div>
 
+      <ClientPortalsPanel
+        portals={clientPortals}
+        onCreate={() => setPortalModal({ active: true })}
+        onEdit={setPortalModal}
+        onToggle={(portal) => saveClientPortal({ ...portal, active: !portal.active })}
+      />
+
       {deployOpen && (
         <DeployVehicleModal
           vehicles={vehicles}
@@ -1381,7 +1611,137 @@ function OperationsHub({
       {clientModalOpen && <ClientOnboardingModal addClient={async (event) => { const ok = await addClient(event); if (ok) setClientModalOpen(false); }} closeModal={() => setClientModalOpen(false)} />}
       {parkingModalOpen && <ParkingOnboardingModal addParkingSite={async (data) => { const result = await addParkingSite(data); if (result?.ok) setParkingModalOpen(false); return result; }} closeModal={() => setParkingModalOpen(false)} />}
       {driverModalOpen && <DriverOnboardingModal addDriver={async (event) => { const ok = await addDriver(event); if (ok) setDriverModalOpen(false); }} closeModal={() => setDriverModalOpen(false)} />}
+      {portalModal && (
+        <ClientPortalModal
+          clientHubs={clientHubs}
+          closeModal={() => setPortalModal(null)}
+          portal={portalModal}
+          saveClientPortal={async (payload) => {
+            const saved = await saveClientPortal(payload);
+            if (saved) setPortalModal(null);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function ClientPortalsPanel({ portals = [], onCreate, onEdit, onToggle }) {
+  const [copiedPortalId, setCopiedPortalId] = useState('');
+
+  async function copyPortalLink(portal) {
+    const link = clientPortalLink(portal.shareToken);
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedPortalId(portal.portalId);
+      window.setTimeout(() => setCopiedPortalId(''), 1800);
+    } catch {
+      window.prompt('Copy this client link', link);
+    }
+  }
+
+  return (
+    <div className="table-panel client-portals-panel">
+      <div className="panel-title">
+        <div>
+          <h3>Client Live Links</h3>
+          <p className="form-note">Share a live deployed-vehicle view. Only allowlisted emails can open each link.</p>
+        </div>
+        <button className="primary-action compact-action" type="button" onClick={onCreate}>
+          <Link2 size={17} /> Create client link
+        </button>
+      </div>
+
+      <div className="table-wrap client-portals-table-wrap" role="region" aria-label="Client live links table">
+        <table className="client-portals-table">
+          <thead>
+            <tr>
+              <th>Link name</th>
+              <th>Client</th>
+              <th>Allowed emails</th>
+              <th>Status</th>
+              <th>Share link</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {portals.length ? portals.map((portal) => (
+              <tr key={portal.portalId}>
+                <td>{portal.label}</td>
+                <td>{portal.client}</td>
+                <td>{portal.allowedEmails.length}</td>
+                <td><span className={`status-pill ${portal.active ? 'success' : 'warning'}`}>{portal.active ? 'Active' : 'Disabled'}</span></td>
+                <td><span className="portal-link-preview">{clientPortalLink(portal.shareToken)}</span></td>
+                <td>
+                  <div className="portal-row-actions">
+                    <button className="ghost-action compact-action" type="button" onClick={() => copyPortalLink(portal)}>
+                      <Copy size={16} /> {copiedPortalId === portal.portalId ? 'Copied' : 'Copy'}
+                    </button>
+                    <button className="ghost-action compact-action" type="button" onClick={() => onEdit(portal)}>
+                      <Pencil size={16} /> Edit
+                    </button>
+                    <button className="ghost-action compact-action" type="button" onClick={() => onToggle(portal)}>
+                      {portal.active ? 'Disable' : 'Enable'}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            )) : (
+              <tr>
+                <td colSpan={6}><div className="empty-state">No client live links created yet.</div></td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ClientPortalModal({ clientHubs = [], closeModal, portal, saveClientPortal }) {
+  const editing = Boolean(portal.portalId);
+  const [label, setLabel] = useState(portal.label || '');
+  const [client, setClient] = useState(portal.client || clientHubs[0]?.client || '');
+  const [allowedEmails, setAllowedEmails] = useState((portal.allowedEmails || []).join('\n'));
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    await saveClientPortal({
+      portalId: portal.portalId || '',
+      label: label.trim() || `${client} live fleet`,
+      client,
+      allowedEmails,
+      active: portal.active !== false,
+    });
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <form className="modal-card client-hub-form add-client-modal client-portal-modal" onSubmit={handleSubmit}>
+        <div className="panel-title">
+          <div>
+            <span>Client access</span>
+            <h2>{editing ? 'Edit Client Link' : 'Create Client Link'}</h2>
+          </div>
+          <button className="ghost-action compact-action" type="button" onClick={closeModal}><X size={17} /> Close</button>
+        </div>
+        <label>Link name<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={`${client || 'Client'} live fleet`} /></label>
+        <label>Client
+          <select value={client} onChange={(event) => setClient(event.target.value)} disabled={editing} required>
+            <option value="">Select client</option>
+            {clientHubs.map((item) => <option key={item.client} value={item.client}>{item.client}</option>)}
+          </select>
+        </label>
+        <label>Allowed email IDs
+          <textarea value={allowedEmails} onChange={(event) => setAllowedEmails(event.target.value)} placeholder={'client.ops@example.com\nmanager@example.com'} rows={6} required />
+        </label>
+        <p className="form-note">Add one email per line, or separate emails with commas. Access is checked again every time the link loads.</p>
+        <div className="modal-actions">
+          <button className="ghost-action" type="button" onClick={closeModal}>Cancel</button>
+          <button className="primary-action" type="submit"><Check size={18} /> {editing ? 'Save access' : 'Create link'}</button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -4269,4 +4629,19 @@ function canAccess(user, permission) {
   return permissions.includes(permission);
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+function clientPortalLink(token) {
+  return `${window.location.origin}${window.location.pathname}?portal=${encodeURIComponent(token || '')}`;
+}
+
+function vehicleMapLink(vehicle) {
+  const lat = Number(vehicle?.lat);
+  const lng = Number(vehicle?.lng);
+  return Number.isFinite(lat) && Number.isFinite(lng) ? `https://www.google.com/maps?q=${lat},${lng}` : '';
+}
+
+function RootApp() {
+  const clientPortalToken = new URLSearchParams(window.location.search).get('portal');
+  return clientPortalToken ? <ClientPortalApp token={clientPortalToken} /> : <App />;
+}
+
+createRoot(document.getElementById('root')).render(<RootApp />);

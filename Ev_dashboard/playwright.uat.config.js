@@ -6,7 +6,7 @@ export default defineConfig({
   expect: { timeout: 8_000 },
   reporter: [['list'], ['html', { open: 'never', outputFolder: 'uat-report' }]],
   use: {
-    baseURL: 'http://127.0.0.1:5173',
+    baseURL: 'http://127.0.0.1:5174',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
@@ -22,8 +22,8 @@ export default defineConfig({
       timeout: 30_000,
     },
     {
-      command: 'npm run dev -- --port 5173',
-      url: 'http://127.0.0.1:5173',
+      command: 'npm run dev -- --mode uat --port 5174',
+      url: 'http://127.0.0.1:5174',
       reuseExistingServer: true,
       timeout: 30_000,
     },

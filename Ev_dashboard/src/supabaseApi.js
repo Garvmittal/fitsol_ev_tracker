@@ -5,10 +5,11 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 const staticLoginOtp = String(import.meta.env.VITE_STATIC_LOGIN_OTP || '123456').trim();
 const staticLoginPassword = String(import.meta.env.VITE_STATIC_LOGIN_PASSWORD || staticLoginOtp).trim();
 const staticLoginEnabled = Boolean(staticLoginOtp);
+const forceHttpApi = String(import.meta.env.VITE_FORCE_HTTP_API || '').toLowerCase() === 'true';
 const assumedAverageSpeedKmph = 24;
 const indiaOffsetMs = 5.5 * 60 * 60 * 1000;
 
-export const supabaseDirectEnabled = Boolean(supabaseUrl && supabaseAnonKey);
+export const supabaseDirectEnabled = Boolean(supabaseUrl && supabaseAnonKey) && !forceHttpApi;
 
 export const supabase = supabaseDirectEnabled
   ? createClient(supabaseUrl, supabaseAnonKey, {
@@ -32,6 +33,11 @@ export async function supabaseApiJson(url, options = {}) {
   if (path === '/api/auth/me' && method === 'GET') return authMe();
   if (path === '/api/auth/logout' && method === 'POST') return logout();
   if (path === '/api/config' && method === 'GET') return config();
+  if (path === '/api/client-portals/access' && method === 'GET') return getClientPortalAccess(query.get('token'));
+  if (path === '/api/client-portals/me' && method === 'GET') return getClientPortalMe(query.get('token'));
+  if (path === '/api/client-portals/request-otp' && method === 'POST') return requestClientPortalOtp(body);
+  if (path === '/api/client-portals/verify-otp' && method === 'POST') return verifyClientPortalOtp(body);
+  if (path === '/api/client-portals/fleet' && method === 'GET') return getClientPortalFleet(query.get('token'));
 
   const user = await requirePortalUser();
 
@@ -49,6 +55,9 @@ export async function supabaseApiJson(url, options = {}) {
   if (path.startsWith('/api/drivers/') && method === 'PATCH') return updateDriver(path, body, user);
   if (path === '/api/parking-sites' && method === 'GET') return getParkingSites(user);
   if (path === '/api/parking-sites' && method === 'POST') return createParkingSite(body, user);
+  if (path === '/api/client-portals' && method === 'GET') return getClientPortals(user);
+  if (path === '/api/client-portals' && method === 'POST') return createClientPortal(body, user);
+  if (path.startsWith('/api/client-portals/') && method === 'PATCH') return updateClientPortal(path, body, user);
   if (path === '/api/driver-session' && method === 'POST') return updateDriverSession(body, user);
   if (path === '/api/tasks' && method === 'GET') return getTasks(user);
   if (path.startsWith('/api/tasks/') && path.endsWith('/done') && method === 'POST') return markTaskDone(path, user);
@@ -143,6 +152,78 @@ async function logout() {
   return { ok: true };
 }
 
+async function getClientPortalAccess(token, email = '') {
+  const shareToken = String(token || '').trim();
+  if (!shareToken) throw new Error('Client link token is required');
+  const { data, error } = await supabase.rpc('client_portal_access', {
+    p_share_token: shareToken,
+    p_email: normalizeEmail(email),
+  });
+  if (error) throw error;
+  const portal = normalizeClientPortalAccess(data?.[0]);
+  if (!portal || !portal.active) throw new Error('This client link is invalid or no longer active');
+  return { portal };
+}
+
+async function requestClientPortalOtp(body) {
+  const email = normalizeEmail(body.email);
+  const token = String(body.token || '').trim();
+  if (!email) throw new Error('Email is required');
+  const { portal } = await getClientPortalAccess(token, email);
+  if (!portal.allowed) throw new Error('This email is not allowed to open this client link');
+  const { error } = await supabase.auth.signInWithOtp({
+    email,
+    options: {
+      shouldCreateUser: true,
+      emailRedirectTo: `${window.location.origin}${window.location.pathname}?portal=${encodeURIComponent(token)}`,
+    },
+  });
+  if (error) throw new Error(error.message || 'Unable to send OTP');
+  return { ok: true, delivery: 'supabase' };
+}
+
+async function verifyClientPortalOtp(body) {
+  const email = normalizeEmail(body.email);
+  const token = String(body.token || '').trim();
+  const otp = String(body.otp || '').trim();
+  if (!email || !token || !otp) throw new Error('Email and OTP are required');
+  const { portal } = await getClientPortalAccess(token, email);
+  if (!portal.allowed) throw new Error('This email is not allowed to open this client link');
+  const { data, error } = await supabase.auth.verifyOtp({ email, token: otp, type: 'email' });
+  if (error) throw new Error(error.message || 'Invalid or expired OTP');
+  return getClientPortalMe(token, data.user?.email || email);
+}
+
+async function getClientPortalMe(token, knownEmail = '') {
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw new Error(error.message);
+  const email = normalizeEmail(knownEmail || data.session?.user?.email);
+  if (!email) throw new Error('Not signed in');
+  const { portal } = await getClientPortalAccess(token, email);
+  if (!portal.allowed) {
+    await supabase.auth.signOut();
+    throw new Error('This email is not allowed to open this client link');
+  }
+  return { user: clientPortalUser(email, portal), portal };
+}
+
+async function getClientPortalFleet(token) {
+  const { user, portal } = await getClientPortalMe(token);
+  const payload = await getFleet(user);
+  return { ...payload, portal };
+}
+
+function clientPortalUser(email, portal) {
+  return {
+    name: email,
+    email,
+    role: 'client',
+    client: portal.client,
+    permissions: ['fleet', 'reports'],
+    portalId: portal.portalId,
+  };
+}
+
 function config() {
   return {
     googleMaps: {
@@ -205,7 +286,7 @@ async function getFleet(user) {
   const latestSnapshots = latestSnapshotByVehicle(snapshots || []);
   const settings = settingsPayload?.settings || normalizeSettings();
   const fleetRows = mergeVehicleRowsWithSnapshots(vehicles || [], latestSnapshots);
-  const rows = scopeRows(fleetRows, user).map((vehicle, index) => (
+  const rows = fleetRows.map((vehicle, index) => (
     mergeVehicleOpsData(
       normalizeVehicle(vehicle, index, latestSnapshotForVehicle(vehicle, latestSnapshots), settings),
       latestDeployments.get(vehicleKey(vehicle.id)),
@@ -213,7 +294,7 @@ async function getFleet(user) {
       index,
     )
   ));
-  return { vehicles: rows, updatedAt: new Date().toISOString() };
+  return { vehicles: scopeRows(rows, user), updatedAt: new Date().toISOString() };
 }
 
 function mergeVehicleRowsWithSnapshots(vehicles, latestSnapshots) {
@@ -361,6 +442,51 @@ async function createParkingSite(body, user) {
   const { error } = await supabase.from('parking_sites').insert(row);
   if (error) throw error;
   return getParkingSites(user);
+}
+
+async function getClientPortals(user) {
+  requirePermission(user, 'deployments');
+  const rows = await listRows('client_portals', 'created_at', false);
+  return { portals: (rows || []).map(normalizeClientPortal) };
+}
+
+async function createClientPortal(body, user) {
+  requirePermission(user, 'deployments');
+  const client = String(body.client || '').trim();
+  const allowedEmails = parseEmailList(body.allowedEmails);
+  if (!client) throw new Error('Client is required');
+  if (!allowedEmails.length) throw new Error('Add at least one allowed email');
+  const row = {
+    portal_id: cryptoRandomId(),
+    share_token: cryptoRandomToken(),
+    label: String(body.label || `${client} live fleet`).trim(),
+    client,
+    allowed_emails: allowedEmails,
+    active: body.active !== false,
+    created_by: user.email,
+    created_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from('client_portals').insert(row);
+  if (error) throw error;
+  return getClientPortals(user);
+}
+
+async function updateClientPortal(path, body, user) {
+  requirePermission(user, 'deployments');
+  const portalId = decodeURIComponent(path.split('/').pop() || '');
+  const allowedEmails = parseEmailList(body.allowedEmails);
+  if (!portalId) throw new Error('Client link is required');
+  if (!allowedEmails.length) throw new Error('Add at least one allowed email');
+  const patch = {
+    label: String(body.label || '').trim(),
+    allowed_emails: allowedEmails,
+    active: body.active !== false,
+    updated_by: user.email,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from('client_portals').update(patch).eq('portal_id', portalId);
+  if (error) throw error;
+  return getClientPortals(user);
 }
 
 async function createDeployment(body, user) {
@@ -1007,6 +1133,30 @@ function normalizeParkingSite(row) {
   };
 }
 
+function normalizeClientPortal(row) {
+  return {
+    portalId: row.portal_id || '',
+    shareToken: row.share_token || '',
+    label: row.label || '',
+    client: row.client || '',
+    allowedEmails: parseEmailList(row.allowed_emails),
+    active: row.active !== false,
+    createdAt: row.created_at || '',
+    updatedAt: row.updated_at || '',
+  };
+}
+
+function normalizeClientPortalAccess(row) {
+  if (!row) return null;
+  return {
+    portalId: row.portal_id || '',
+    label: row.label || '',
+    client: row.client || '',
+    active: row.active !== false,
+    allowed: row.allowed === true,
+  };
+}
+
 function normalizeTask(row) {
   return {
     id: row.task_id || row.id || '',
@@ -1605,6 +1755,11 @@ function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function parseEmailList(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(/[\s,;]+/);
+  return [...new Set(items.map(normalizeEmail).filter((email) => email && email.includes('@')))];
+}
+
 function normalizePhone(value) {
   return String(value || '').replace(/\D/g, '');
 }
@@ -1662,4 +1817,12 @@ function dateOnly(value) {
 function cryptoRandomId() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function cryptoRandomToken() {
+  if (window.crypto?.getRandomValues) {
+    const bytes = window.crypto.getRandomValues(new Uint8Array(32));
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+  return `${cryptoRandomId()}${cryptoRandomId()}`.replace(/-/g, '');
 }

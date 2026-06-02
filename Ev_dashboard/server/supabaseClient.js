@@ -146,6 +146,39 @@ export async function createParkingSite(site) {
   return data?.[0] || null;
 }
 
+export async function listClientPortals() {
+  const db = getClient();
+  const { data, error } = await db.from('client_portals').select('*').order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+export async function createClientPortal(portal) {
+  const db = getClient();
+  const { data, error } = await db.from('client_portals').insert(portal).select();
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+export async function updateClientPortal(portalId, patch) {
+  const db = getClient();
+  const { data, error } = await db
+    .from('client_portals')
+    .update(patch)
+    .eq('portal_id', portalId)
+    .select()
+    .limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+export async function findClientPortalByToken(shareToken) {
+  const db = getClient();
+  const { data, error } = await db.from('client_portals').select('*').eq('share_token', shareToken).limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
 export async function getSettings() {
   const db = getClient();
   const { data, error } = await db.from('settings').select('*');
@@ -180,6 +213,10 @@ export default {
   updateDriverPhone,
   listParkingSites,
   createParkingSite,
+  listClientPortals,
+  createClientPortal,
+  updateClientPortal,
+  findClientPortalByToken,
   getSettings,
   upsertSettings,
   getAnonClient,
